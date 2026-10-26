@@ -59,9 +59,9 @@ class MLService extends ChangeNotifier {
 
   Future<void> initialize() async {
     try {
-      // 1. Load labels from labels folder
+      // 1. Load labels directly from model/labels/labels.txt
       try {
-        final labelData = await rootBundle.loadString('assets/labels/labels.txt');
+        final labelData = await rootBundle.loadString('model/labels/labels.txt');
         _labels = labelData
             .split('\n')
             .map((e) => e.trim())
@@ -69,7 +69,7 @@ class MLService extends ChangeNotifier {
             .toList();
       } catch (e) {
         try {
-          final labelData = await rootBundle.loadString('model/labels/labels.txt');
+          final labelData = await rootBundle.loadString('assets/labels/labels.txt');
           _labels = labelData
               .split('\n')
               .map((e) => e.trim())
@@ -81,18 +81,15 @@ class MLService extends ChangeNotifier {
         }
       }
 
-      // 2. Attempt TFLite model load
+      // 2. Load TFLite model directly from model/model.tflite
       bool modelLoaded = false;
-      bool yoloLoaded = false;
-      bool cnnLoaded = false;
-
       try {
-        _interpreter = await Interpreter.fromAsset('assets/models/model.tflite');
+        _interpreter = await Interpreter.fromAsset('model/model.tflite');
         _cnnInterpreter ??= _interpreter;
         modelLoaded = true;
       } catch (e) {
         try {
-          _interpreter = await Interpreter.fromAsset('model/model.tflite');
+          _interpreter = await Interpreter.fromAsset('assets/models/model.tflite');
           _cnnInterpreter ??= _interpreter;
           modelLoaded = true;
         } catch (e2) {
@@ -100,36 +97,12 @@ class MLService extends ChangeNotifier {
         }
       }
 
-      try {
-        final yoloOptions = tflite.InterpreterOptions()..threads = 4;
-        _yoloInterpreter = await Interpreter.fromAsset(
-          'assets/models/landmark_yolo.tflite',
-          options: yoloOptions,
-        );
-        yoloLoaded = true;
-      } catch (e) {
-        debugPrint('YOLO model not found or not supported on this platform: $e');
-      }
-
-      try {
-        final cnnOptions = tflite.InterpreterOptions()..threads = 4;
-        _cnnInterpreter = await Interpreter.fromAsset(
-          'assets/models/landmark_cnn.tflite',
-          options: cnnOptions,
-        );
-        cnnLoaded = true;
-      } catch (e) {
-        debugPrint('CNN model not found or not supported on this platform: $e');
-      }
-
-      if (modelLoaded || (yoloLoaded && cnnLoaded)) {
+      if (modelLoaded) {
         _mode = MLInferenceMode.tfliteHardware;
-        _statusMessage = modelLoaded
-            ? 'TFLite Hardware Acceleration Active (model.tflite)'
-            : 'YOLOv8 + CNN Hardware Acceleration Active';
+        _statusMessage = 'TFLite Hardware Acceleration Active (model.tflite)';
       } else {
         _mode = MLInferenceMode.simulationEngine;
-        _statusMessage = 'AI Recognition Engine Ready (YOLO + CNN)';
+        _statusMessage = 'AI Recognition Engine Ready (Simulation Fallback)';
       }
 
       _isInitialized = true;
