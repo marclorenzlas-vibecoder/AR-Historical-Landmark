@@ -23,18 +23,44 @@ class MLService extends ChangeNotifier {
   String _statusMessage = 'Initializing ML Core...';
   int _lastInferenceTimeMs = 24;
 
+  // Reusable 4D tensor buffer to eliminate 50,000 List allocations per camera frame
+  final List<List<List<List<double>>>> _inputTensorBuffer = List.generate(
+    1,
+    (_) => List.generate(
+      224,
+      (_) => List.generate(
+        224,
+        (_) => [0.0, 0.0, 0.0],
+      ),
+    ),
+  );
+
+  double _confidenceThreshold = 0.96; // Default 96% strictness (turns off on non-monument backgrounds)
+
   bool get isInitialized => _isInitialized;
   MLInferenceMode get mode => _mode;
   String get statusMessage => _statusMessage;
   int get lastInferenceTimeMs => _lastInferenceTimeMs;
   List<String> get labels => _labels;
   Interpreter? get interpreter => _interpreter;
+  double get confidenceThreshold => _confidenceThreshold;
+
+  set confidenceThreshold(double value) {
+    final clamped = value.clamp(0.50, 0.99);
+    if ((_confidenceThreshold - clamped).abs() > 0.001) {
+      _confidenceThreshold = clamped;
+      notifyListeners();
+    }
+  }
+
+  void setConfidenceThreshold(double value) {
+    confidenceThreshold = value;
+  }
 
   Future<void> initialize() async {
     try {
       // 1. Load labels from labels folder
       try {
-        // Load labels from labels folder
         final labelData = await rootBundle.loadString('assets/labels/labels.txt');
         _labels = labelData
             .split('\n')
@@ -42,8 +68,17 @@ class MLService extends ChangeNotifier {
             .where((e) => e.isNotEmpty)
             .toList();
       } catch (e) {
-        debugPrint('Warning: Could not load labels.txt: $e');
-        _labels = LandmarkDataService.allLandmarks.map((l) => l.labelKey).toList();
+        try {
+          final labelData = await rootBundle.loadString('model/labels/labels.txt');
+          _labels = labelData
+              .split('\n')
+              .map((e) => e.trim())
+              .where((e) => e.isNotEmpty)
+              .toList();
+        } catch (e2) {
+          debugPrint('Warning: Could not load labels.txt: $e2');
+          _labels = LandmarkDataService.allLandmarks.map((l) => l.labelKey).toList();
+        }
       }
 
       // 2. Attempt TFLite model load
@@ -52,12 +87,17 @@ class MLService extends ChangeNotifier {
       bool cnnLoaded = false;
 
       try {
-        // Load model from models folder
         _interpreter = await Interpreter.fromAsset('assets/models/model.tflite');
         _cnnInterpreter ??= _interpreter;
         modelLoaded = true;
       } catch (e) {
-        debugPrint('Model model.tflite not found or not supported on this platform: $e');
+        try {
+          _interpreter = await Interpreter.fromAsset('model/model.tflite');
+          _cnnInterpreter ??= _interpreter;
+          modelLoaded = true;
+        } catch (e2) {
+          debugPrint('Model model.tflite not found or not supported on this platform: $e2');
+        }
       }
 
       try {
@@ -103,20 +143,60 @@ class MLService extends ChangeNotifier {
   }
 
   /// Process live camera frame with TFLite model and return detected landmark
-  Future<RecognitionResult?> processCameraImage(CameraImage image) async {
+  Future<RecognitionResult?> processCameraImage(
+    CameraImage image, {
+    int sensorOrientation = 90,
+  }) async {
     final activeInterpreter = _interpreter ?? _cnnInterpreter;
     if (activeInterpreter == null) {
-      // Fallback simulation when native interpreter is unavailable
-      return processFrame();
+      return null;
     }
 
     final stopwatch = Stopwatch()..start();
 
     try {
-      // 1. Center crop and sample into 224x224 tensor normalized [-1.0, 1.0]
-      final input = _preprocessCameraImage(image, 224, 224);
+      // 0. Quick scene texture check: avoid running model on flat walls, floors, ceilings, or covered lenses
+      if (image.planes.isNotEmpty) {
+        final Plane yPlane = image.planes[0];
+        final Uint8List yBytes = yPlane.bytes;
+        final int stride = yPlane.bytesPerRow;
+        int minLuma = 255;
+        int maxLuma = 0;
+        for (int i = 1; i <= 5; i++) {
+          final int sy = (image.height * i ~/ 6) * stride;
+          for (int j = 1; j <= 5; j++) {
+            final int sx = image.width * j ~/ 6;
+            final int idx = sy + sx;
+            if (idx < yBytes.length) {
+              final int val = yBytes[idx];
+              if (val < minLuma) minLuma = val;
+              if (val > maxLuma) maxLuma = val;
+            }
+          }
+        }
+        if ((maxLuma - minLuma) < 24) {
+          // Flat, uniform surface (wall, floor, table, dark room) - return searching immediately
+          return RecognitionResult(
+            label: 'searching',
+            yoloConfidence: 0.0,
+            cnnConfidence: 0.0,
+            boundingBox: null,
+            inferenceTimeMs: 2,
+            landmark: null,
+            allProbabilities: const {},
+          );
+        }
+      }
 
-      // 2. Prepare output tensor matching class count
+      // 1. Center crop and sample into 224x224 tensor rotated UPRIGHT matching device orientation
+      final input = _preprocessCameraImage(
+        image,
+        224,
+        224,
+        sensorOrientation: sensorOrientation,
+      );
+
+      // 2. Prepare output tensor matching class count (default 3 classes: cathedral, lccb, plaza)
       final numClasses = _labels.isNotEmpty ? _labels.length : 3;
       final output = List.generate(1, (_) => List.filled(numClasses, 0.0));
 
@@ -126,47 +206,74 @@ class MLService extends ChangeNotifier {
       stopwatch.stop();
       _lastInferenceTimeMs = max(8, stopwatch.elapsedMilliseconds);
 
-      // 4. Compute Softmax probabilities
+      // 4. Calculate probabilities (handles both Softmax and raw Logits)
       final rawScores = output[0];
-      double maxScore = rawScores.reduce((curr, next) => curr > next ? curr : next);
-      double expSum = 0.0;
-      final expScores = <double>[];
-      for (final s in rawScores) {
-        final e = exp((s - maxScore).clamp(-50.0, 50.0));
-        expScores.add(e);
-        expSum += e;
-      }
+      List<double> probabilities = _calculateSoftmax(rawScores);
 
       int bestIdx = 0;
-      double bestProb = 0.0;
-      for (int i = 0; i < expScores.length; i++) {
-        final prob = expSum > 0 ? (expScores[i] / expSum) : 0.0;
-        if (prob > bestProb) {
-          bestProb = prob;
+      double bestProb = probabilities[0];
+      double secondProb = 0.0;
+
+      for (int i = 1; i < probabilities.length; i++) {
+        if (probabilities[i] > bestProb) {
+          secondProb = bestProb;
+          bestProb = probabilities[i];
           bestIdx = i;
+        } else if (probabilities[i] > secondProb) {
+          secondProb = probabilities[i];
         }
       }
 
-      final detectedKey = (bestIdx < _labels.length) ? _labels[bestIdx] : _labels.first;
-      final landmark = LandmarkDataService.findByLabel(detectedKey);
+      // 5. Target Frame Classification Decision:
+      // Uses dynamic user-adjustable confidence threshold slider (default 96%)
+      final double effectiveThreshold = _confidenceThreshold;
+      final double effectiveMargin = (effectiveThreshold * 0.55).clamp(0.20, 0.70);
+      final bool isConfident = bestProb >= effectiveThreshold &&
+          (bestProb - secondProb) >= effectiveMargin &&
+          bestIdx >= 0 &&
+          bestIdx < _labels.length;
 
-      // If confidence exceeds detection threshold, lock bounding box onto landmark
-      final BoundingBox? box = bestProb >= 0.40
-          ? const BoundingBox(
-              left: 0.12,
-              top: 0.15,
-              right: 0.88,
-              bottom: 0.80,
-            )
-          : null;
+      if (isConfident) {
+        final detectedKey = _labels[bestIdx];
+        final landmark = LandmarkDataService.findByLabel(detectedKey);
 
+        if (landmark != null) {
+          final box = _calculateLandmarkBoundingBox(
+            image,
+            detectedKey,
+            sensorOrientation,
+          );
+          final Map<String, double> probMap = {};
+          for (int i = 0; i < probabilities.length && i < _labels.length; i++) {
+            probMap[_labels[i]] = probabilities[i];
+          }
+
+          return RecognitionResult(
+            label: detectedKey,
+            yoloConfidence: bestProb,
+            cnnConfidence: bestProb,
+            boundingBox: box,
+            inferenceTimeMs: _lastInferenceTimeMs,
+            landmark: landmark,
+            allProbabilities: probMap,
+          );
+        }
+      }
+
+      final Map<String, double> probMap = {};
+      for (int i = 0; i < probabilities.length && i < _labels.length; i++) {
+        probMap[_labels[i]] = probabilities[i];
+      }
+
+      // Target frame does not currently have a confident landmark match (searching)
       return RecognitionResult(
-        label: detectedKey,
-        yoloConfidence: bestProb,
-        cnnConfidence: bestProb,
-        boundingBox: box,
+        label: 'searching',
+        yoloConfidence: 0.0,
+        cnnConfidence: 0.0,
+        boundingBox: null,
         inferenceTimeMs: _lastInferenceTimeMs,
-        landmark: landmark,
+        landmark: null,
+        allProbabilities: probMap,
       );
     } catch (e) {
       debugPrint('Real-time frame inference error: $e');
@@ -174,18 +281,69 @@ class MLService extends ChangeNotifier {
     }
   }
 
-  /// Center-crop and sample camera frame to [1, 224, 224, 3] Float tensor in [-1.0, 1.0]
+  List<double> _calculateSoftmax(List<double> rawScores) {
+    final sumScores = rawScores.fold(0.0, (sum, val) => sum + val);
+    final allPositive = rawScores.every((val) => val >= 0.0);
+    if (allPositive && (sumScores - 1.0).abs() < 0.15) {
+      return List<double>.from(rawScores);
+    }
+    double maxScore = rawScores.reduce((curr, next) => curr > next ? curr : next);
+    double expSum = 0.0;
+    final expScores = <double>[];
+    for (final s in rawScores) {
+      final e = exp((s - maxScore).clamp(-50.0, 50.0));
+      expScores.add(e);
+      expSum += e;
+    }
+    return expScores.map((e) => expSum > 0 ? e / expSum : 0.0).toList();
+  }
+
+  /// Returns a clean, centered landmark-proportioned bounding box matching Photo Mode
+  BoundingBox _calculateLandmarkBoundingBox(
+    CameraImage image,
+    String landmarkKey,
+    int sensorOrientation,
+  ) {
+    switch (landmarkKey.toLowerCase()) {
+      case 'cathedral':
+        return const BoundingBox(
+          left: 0.14,
+          top: 0.15,
+          right: 0.86,
+          bottom: 0.73,
+        );
+      case 'lccb':
+        return const BoundingBox(
+          left: 0.08,
+          top: 0.18,
+          right: 0.92,
+          bottom: 0.68,
+        );
+      case 'plaza':
+      default:
+        return const BoundingBox(
+          left: 0.12,
+          top: 0.16,
+          right: 0.88,
+          bottom: 0.70,
+        );
+    }
+  }
+
+  /// Extracts and rotates the central Target Frame to an upright [1, 224, 224, 3] Float tensor in [0.0, 255.0]
   List<List<List<List<double>>>> _preprocessCameraImage(
     CameraImage image,
     int targetW,
-    int targetH,
-  ) {
+    int targetH, {
+    int sensorOrientation = 90,
+  }) {
     final int width = image.width;
     final int height = image.height;
 
+    // Crop the central square of the camera sensor
     final int cropSize = min(width, height);
-    final int offsetX = (width - cropSize) ~/ 2;
-    final int offsetY = (height - cropSize) ~/ 2;
+    final double centerX = width / 2.0;
+    final double centerY = height / 2.0;
 
     // Android YUV420 format
     if (image.format.group == ImageFormatGroup.yuv420 || image.planes.length >= 3) {
@@ -196,37 +354,61 @@ class MLService extends ChangeNotifier {
       final int yRowStride = yPlane.bytesPerRow;
       final int uvRowStride = uPlane.bytesPerRow;
       final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
+      final int vPixelStride = vPlane.bytesPerPixel ?? 1;
 
-      return List.generate(
-        1,
-        (_) => List.generate(targetH, (outY) {
-          final int srcY = (offsetY + (outY * cropSize ~/ targetH)).clamp(0, height - 1);
+      for (int outY = 0; outY < targetH; outY++) {
+        final double v = (outY + 0.5) / targetH; // 0..1 from top to bottom of screen in portrait
+        final row = _inputTensorBuffer[0][outY];
+        for (int outX = 0; outX < targetW; outX++) {
+          final double u = (outX + 0.5) / targetW; // 0..1 from left to right of screen in portrait
+
+          int srcX;
+          int srcY;
+
+          // Rotate sensor pixels to be UPRIGHT in portrait mode
+          if (sensorOrientation == 90) {
+            // 90 deg CW on Android back camera:
+            // Screen down (+v) is sensor right (+X)
+            // Screen right (+u) is sensor top (-Y)
+            srcX = (centerX + (v - 0.5) * cropSize).round().clamp(0, width - 1);
+            srcY = (centerY + (0.5 - u) * cropSize).round().clamp(0, height - 1);
+          } else if (sensorOrientation == 270) {
+            srcX = (centerX + (0.5 - v) * cropSize).round().clamp(0, width - 1);
+            srcY = (centerY + (u - 0.5) * cropSize).round().clamp(0, height - 1);
+          } else if (sensorOrientation == 180) {
+            srcX = (centerX + (0.5 - u) * cropSize).round().clamp(0, width - 1);
+            srcY = (centerY + (0.5 - v) * cropSize).round().clamp(0, height - 1);
+          } else {
+            srcX = (centerX + (u - 0.5) * cropSize).round().clamp(0, width - 1);
+            srcY = (centerY + (v - 0.5) * cropSize).round().clamp(0, height - 1);
+          }
+
+          final int uvX = srcX ~/ 2;
           final int uvY = srcY ~/ 2;
-          return List.generate(targetW, (outX) {
-            final int srcX = (offsetX + (outX * cropSize ~/ targetW)).clamp(0, width - 1);
-            final int uvX = srcX ~/ 2;
 
-            final int yIndex = srcY * yRowStride + srcX;
-            final int uIndex = uvY * uvRowStride + uvX * uvPixelStride;
-            final int vIndex = uvY * vPlane.bytesPerRow + uvX * (vPlane.bytesPerPixel ?? 1);
+          final int yIndex = srcY * yRowStride + srcX;
+          final int uIndex = uvY * uvRowStride + uvX * uvPixelStride;
+          final int vIndex = uvY * vPlane.bytesPerRow + uvX * vPixelStride;
 
-            final int yVal = (yIndex < yPlane.bytes.length) ? yPlane.bytes[yIndex] : 0;
-            final int uVal = (uIndex < uPlane.bytes.length) ? uPlane.bytes[uIndex] - 128 : 0;
-            final int vVal = (vIndex < vPlane.bytes.length) ? vPlane.bytes[vIndex] - 128 : 0;
+          final int yVal = (yIndex < yPlane.bytes.length) ? yPlane.bytes[yIndex] : 0;
+          final int uVal = (uIndex >= 0 && uIndex < uPlane.bytes.length)
+              ? uPlane.bytes[uIndex] - 128
+              : 0;
+          final int vVal = (vIndex >= 0 && vIndex < vPlane.bytes.length)
+              ? vPlane.bytes[vIndex] - 128
+              : 0;
 
-            final double r = (yVal + 1.402 * vVal).clamp(0.0, 255.0);
-            final double g = (yVal - 0.344136 * uVal - 0.714136 * vVal).clamp(0.0, 255.0);
-            final double b = (yVal + 1.772 * uVal).clamp(0.0, 255.0);
+          final double r = (yVal + 1.402 * vVal).clamp(0.0, 255.0);
+          final double g = (yVal - 0.344136 * uVal - 0.714136 * vVal).clamp(0.0, 255.0);
+          final double b = (yVal + 1.772 * uVal).clamp(0.0, 255.0);
 
-            // Normalized to [-1.0, 1.0] for MobileNetV2
-            return [
-              (r - 127.5) / 127.5,
-              (g - 127.5) / 127.5,
-              (b - 127.5) / 127.5,
-            ];
-          });
-        }),
-      );
+          final pixel = row[outX];
+          pixel[0] = r;
+          pixel[1] = g;
+          pixel[2] = b;
+        }
+      }
+      return _inputTensorBuffer;
     }
 
     // iOS BGRA8888 or single plane format
@@ -235,34 +417,43 @@ class MLService extends ChangeNotifier {
       final bytes = plane.bytes;
       final int bytesPerRow = plane.bytesPerRow;
 
-      return List.generate(
-        1,
-        (_) => List.generate(targetH, (outY) {
-          final int srcY = (offsetY + (outY * cropSize ~/ targetH)).clamp(0, height - 1);
-          return List.generate(targetW, (outX) {
-            final int srcX = (offsetX + (outX * cropSize ~/ targetW)).clamp(0, width - 1);
-            final int index = srcY * bytesPerRow + srcX * 4;
-            if (index + 2 < bytes.length) {
-              final double b = bytes[index].toDouble();
-              final double g = bytes[index + 1].toDouble();
-              final double r = bytes[index + 2].toDouble();
-              return [
-                (r - 127.5) / 127.5,
-                (g - 127.5) / 127.5,
-                (b - 127.5) / 127.5,
-              ];
-            }
-            return [0.0, 0.0, 0.0];
-          });
-        }),
-      );
+      for (int outY = 0; outY < targetH; outY++) {
+        final double v = (outY + 0.5) / targetH;
+        final row = _inputTensorBuffer[0][outY];
+        for (int outX = 0; outX < targetW; outX++) {
+          final double u = (outX + 0.5) / targetW;
+
+          int srcX;
+          int srcY;
+
+          if (sensorOrientation == 90) {
+            srcX = (centerX + (v - 0.5) * cropSize).round().clamp(0, width - 1);
+            srcY = (centerY + (0.5 - u) * cropSize).round().clamp(0, height - 1);
+          } else if (sensorOrientation == 270) {
+            srcX = (centerX + (0.5 - v) * cropSize).round().clamp(0, width - 1);
+            srcY = (centerY + (u - 0.5) * cropSize).round().clamp(0, height - 1);
+          } else {
+            srcX = (centerX + (u - 0.5) * cropSize).round().clamp(0, width - 1);
+            srcY = (centerY + (v - 0.5) * cropSize).round().clamp(0, height - 1);
+          }
+
+          final int index = srcY * bytesPerRow + srcX * 4;
+          final pixel = row[outX];
+          if (index + 2 < bytes.length) {
+            pixel[0] = bytes[index + 2].toDouble();
+            pixel[1] = bytes[index + 1].toDouble();
+            pixel[2] = bytes[index].toDouble();
+          } else {
+            pixel[0] = 0.0;
+            pixel[1] = 0.0;
+            pixel[2] = 0.0;
+          }
+        }
+      }
+      return _inputTensorBuffer;
     }
 
-    // Generic fallback
-    return List.generate(
-      1,
-      (_) => List.generate(targetH, (_) => List.generate(targetW, (_) => [0.0, 0.0, 0.0])),
-    );
+    return _inputTensorBuffer;
   }
 
   /// Process decoded image bytes (e.g. from snapshot or photo library)
@@ -295,9 +486,9 @@ class MLService extends ChangeNotifier {
             (x) {
               final p = resized.getPixel(x, y);
               return [
-                (p.r - 127.5) / 127.5,
-                (p.g - 127.5) / 127.5,
-                (p.b - 127.5) / 127.5,
+                p.r.toDouble(),
+                p.g.toDouble(),
+                p.b.toDouble(),
               ];
             },
           ),
@@ -308,41 +499,89 @@ class MLService extends ChangeNotifier {
       final output = List.generate(1, (_) => List.filled(numClasses, 0.0));
       activeInterpreter.run(input, output);
 
+      // 4. Calculate probabilities (model output is already softmax)
       final rawScores = output[0];
-      double maxScore = rawScores.reduce((curr, next) => curr > next ? curr : next);
-      double expSum = 0.0;
-      final expScores = <double>[];
-      for (final s in rawScores) {
-        final e = exp((s - maxScore).clamp(-50.0, 50.0));
-        expScores.add(e);
-        expSum += e;
-      }
+      final probabilities = _calculateSoftmax(rawScores);
 
       int bestIdx = 0;
-      double bestProb = 0.0;
-      for (int i = 0; i < expScores.length; i++) {
-        final prob = expSum > 0 ? (expScores[i] / expSum) : 0.0;
-        if (prob > bestProb) {
-          bestProb = prob;
+      double bestProb = probabilities[0];
+      double secondProb = 0.0;
+      for (int i = 1; i < probabilities.length; i++) {
+        if (probabilities[i] > bestProb) {
+          secondProb = bestProb;
+          bestProb = probabilities[i];
           bestIdx = i;
+        } else if (probabilities[i] > secondProb) {
+          secondProb = probabilities[i];
         }
       }
 
-      final detectedKey = (bestIdx < _labels.length) ? _labels[bestIdx] : _labels.first;
-      final landmark = LandmarkDataService.findByLabel(detectedKey);
+      final Map<String, double> probMap = {};
+      for (int i = 0; i < probabilities.length && i < _labels.length; i++) {
+        probMap[_labels[i]] = probabilities[i];
+      }
+
+      final double effectiveThreshold = (_confidenceThreshold - 0.08).clamp(0.55, 0.95);
+      final double effectiveMargin = (effectiveThreshold * 0.35).clamp(0.15, 0.45);
+      final bool isConfident = bestIdx >= 0 &&
+          bestIdx < _labels.length &&
+          bestProb >= effectiveThreshold &&
+          (bestProb - secondProb) >= effectiveMargin;
+
+      if (isConfident) {
+        final detectedKey = _labels[bestIdx];
+        final landmark = LandmarkDataService.findByLabel(detectedKey);
+
+        if (landmark != null) {
+          BoundingBox box;
+          switch (detectedKey.toLowerCase()) {
+            case 'cathedral':
+              box = const BoundingBox(
+                left: 0.16,
+                top: 0.10,
+                right: 0.84,
+                bottom: 0.88,
+              );
+              break;
+            case 'lccb':
+              box = const BoundingBox(
+                left: 0.08,
+                top: 0.16,
+                right: 0.92,
+                bottom: 0.82,
+              );
+              break;
+            case 'plaza':
+            default:
+              box = const BoundingBox(
+                left: 0.14,
+                top: 0.16,
+                right: 0.86,
+                bottom: 0.84,
+              );
+              break;
+          }
+
+          return RecognitionResult(
+            label: detectedKey,
+            yoloConfidence: bestProb,
+            cnnConfidence: bestProb,
+            boundingBox: box,
+            inferenceTimeMs: 16,
+            landmark: landmark,
+            allProbabilities: probMap,
+          );
+        }
+      }
 
       return RecognitionResult(
-        label: detectedKey,
-        yoloConfidence: bestProb,
-        cnnConfidence: bestProb,
-        boundingBox: const BoundingBox(
-          left: 0.12,
-          top: 0.15,
-          right: 0.88,
-          bottom: 0.80,
-        ),
+        label: 'searching',
+        yoloConfidence: 0.0,
+        cnnConfidence: 0.0,
+        boundingBox: null,
         inferenceTimeMs: 16,
-        landmark: landmark,
+        landmark: null,
+        allProbabilities: probMap,
       );
     } catch (e) {
       debugPrint('Error processing image bytes: $e');
@@ -357,29 +596,38 @@ class MLService extends ChangeNotifier {
   }) async {
     final stopwatch = Stopwatch()..start();
 
-    // Determine target landmark
-    final targetKey = forcedLandmarkKey ?? _determineTargetFromScene();
-    final landmark = LandmarkDataService.findByLabel(targetKey);
+    // Only recognize if explicitly forced (e.g. testing)
+    if (forcedLandmarkKey != null && forcedLandmarkKey.isNotEmpty) {
+      final landmark = LandmarkDataService.findByLabel(forcedLandmarkKey);
+      if (landmark != null) {
+        final yoloResult = await _runStage1Yolo(forcedLandmarkKey, cameraJitter);
+        final cnnResult = await _runStage2Cnn(forcedLandmarkKey, yoloResult);
+        stopwatch.stop();
+        _lastInferenceTimeMs = max(16, stopwatch.elapsedMilliseconds);
 
-    // Stage 1: YOLO Object Detection (Bounding Box Localization)
-    final yoloResult = await _runStage1Yolo(targetKey, cameraJitter);
-
-    // Stage 2: CNN Deep Feature Classification (Fine-grained landmark identification)
-    final cnnResult = await _runStage2Cnn(targetKey, yoloResult);
+        return RecognitionResult(
+          label: forcedLandmarkKey,
+          yoloConfidence: yoloResult.confidence,
+          cnnConfidence: cnnResult.confidence,
+          boundingBox: yoloResult.boundingBox,
+          inferenceTimeMs: _lastInferenceTimeMs,
+          landmark: landmark,
+        );
+      }
+    }
 
     stopwatch.stop();
     _lastInferenceTimeMs = max(16, stopwatch.elapsedMilliseconds);
 
-    final result = RecognitionResult(
-      label: targetKey,
-      yoloConfidence: yoloResult.confidence,
-      cnnConfidence: cnnResult.confidence,
-      boundingBox: yoloResult.boundingBox,
+    // Default: searching (no fake popup!)
+    return RecognitionResult(
+      label: 'searching',
+      yoloConfidence: 0.0,
+      cnnConfidence: 0.0,
+      boundingBox: null,
       inferenceTimeMs: _lastInferenceTimeMs,
-      landmark: landmark,
+      landmark: null,
     );
-
-    return result;
   }
 
   /// Stage 1: YOLO detection (Bounding Box & ROI localization)
@@ -457,13 +705,6 @@ class MLService extends ChangeNotifier {
       predictedClass: landmarkKey,
       confidence: conf.clamp(0.88, 0.99),
     );
-  }
-
-  String _determineTargetFromScene() {
-    if (_labels.isNotEmpty) {
-      return _labels.first;
-    }
-    return 'eiffel_tower';
   }
 
   @override

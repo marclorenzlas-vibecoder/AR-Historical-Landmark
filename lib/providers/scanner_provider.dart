@@ -1,9 +1,7 @@
-import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import '../models/landmark.dart';
 import '../services/camera_service.dart';
-import '../services/landmark_data_service.dart';
 import '../services/ml_service.dart';
 
 class ScannerProvider extends ChangeNotifier {
@@ -13,8 +11,13 @@ class ScannerProvider extends ChangeNotifier {
   bool _isScanning = true;
   bool _isProcessingFrame = false;
   RecognitionResult? _currentResult;
-  Timer? _scanTimer;
-  String _activeSimulatedLandmarkKey = 'cathedral';
+
+  // Temporal multi-frame stability counters (avoids noise blips from random objects)
+  String? _candidateLabel;
+  int _consecutiveHitCount = 0;
+  int _lastFrameTimestamp = 0;
+  static const int _requiredConsecutiveHits = 2;
+
   final List<RecognitionResult> _discoveryHistory = [];
   double _simulatedDistance = 45.0;
   double _headingDegrees = 42.0;
@@ -25,17 +28,26 @@ class ScannerProvider extends ChangeNotifier {
     required this.mlService,
     CameraService? cameraService,
   }) {
-    _cameraService = cameraService;
-    if (mlService.labels.isNotEmpty) {
-      _activeSimulatedLandmarkKey = mlService.labels.first;
+    if (cameraService != null) {
+      bindCameraService(cameraService);
     }
-    startScanning();
+  }
+
+  double get confidenceThreshold => mlService.confidenceThreshold;
+
+  void setConfidenceThreshold(double value) {
+    mlService.setConfidenceThreshold(value);
+    if (_currentResult != null &&
+        _currentResult!.overallConfidence < mlService.confidenceThreshold) {
+      clearCurrentResult();
+    } else {
+      notifyListeners();
+    }
   }
 
   bool get isScanning => _isScanning;
   bool get isProcessingFrame => _isProcessingFrame;
   RecognitionResult? get currentResult => _currentResult;
-  String get activeSimulatedLandmarkKey => _activeSimulatedLandmarkKey;
   List<RecognitionResult> get discoveryHistory => List.unmodifiable(_discoveryHistory);
   double get simulatedDistance => _simulatedDistance;
   double get headingDegrees => _headingDegrees;
@@ -43,34 +55,51 @@ class ScannerProvider extends ChangeNotifier {
   bool get isAudioPlaying => _isAudioPlaying;
   CameraService? get cameraService => _cameraService;
 
+  /// Manually clears current recognition and turns off bounding box and bottom card
+  void clearCurrentResult() {
+    _currentResult = null;
+    _candidateLabel = null;
+    _consecutiveHitCount = 0;
+    notifyListeners();
+  }
+
   void bindCameraService(CameraService service) {
-    if (_cameraService == service) return;
-    _cameraService = service;
-    if (_isScanning) {
-      startScanning();
+    if (_cameraService != service) {
+      _cameraService?.removeListener(_onCameraStateChanged);
+      _cameraService = service;
+      _cameraService?.addListener(_onCameraStateChanged);
+    }
+    _checkAndStartStreaming();
+  }
+
+  void _onCameraStateChanged() {
+    _checkAndStartStreaming();
+    notifyListeners();
+  }
+
+  void _checkAndStartStreaming() {
+    if (!_isScanning) return;
+    if (_cameraService != null &&
+        _cameraService!.isLiveCamera &&
+        !_cameraService!.isStreaming) {
+      _cameraService!.startImageStream(_onCameraFrame);
     }
   }
 
   void startScanning() {
     _isScanning = true;
-    _scanTimer?.cancel();
-
-    if (_cameraService != null && _cameraService!.isLiveCamera) {
-      // Start live hardware camera stream for real model inference
-      _cameraService!.startImageStream(_onCameraFrame);
-    } else {
-      // Fallback timer for simulated feed / desktop testing
-      _scanTimer = Timer.periodic(const Duration(milliseconds: 180), (_) {
-        _executeSimulatedInference();
-      });
-    }
+    _candidateLabel = null;
+    _consecutiveHitCount = 0;
+    _checkAndStartStreaming();
     notifyListeners();
   }
 
   void stopScanning() {
     _isScanning = false;
-    _scanTimer?.cancel();
     _cameraService?.stopImageStream();
+    _candidateLabel = null;
+    _consecutiveHitCount = 0;
+    _currentResult = null;
     notifyListeners();
   }
 
@@ -82,13 +111,24 @@ class ScannerProvider extends ChangeNotifier {
     }
   }
 
-  /// Real-time camera image stream callback
+  /// Real-time camera image stream callback for live model inference
   void _onCameraFrame(CameraImage image) async {
     if (!_isScanning || _isProcessingFrame) return;
+
+    // Pace inferences to ~5-6 per second (170ms interval) to keep UI smooth and 60fps
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastFrameTimestamp < 170) {
+      return;
+    }
+    _lastFrameTimestamp = now;
     _isProcessingFrame = true;
 
     try {
-      final result = await mlService.processCameraImage(image);
+      final sensorOrientation = _cameraService?.sensorOrientation ?? 90;
+      final result = await mlService.processCameraImage(
+        image,
+        sensorOrientation: sensorOrientation,
+      );
       if (result != null) {
         _handleNewRecognition(result);
       }
@@ -99,57 +139,79 @@ class ScannerProvider extends ChangeNotifier {
     }
   }
 
-  /// Simulated / fallback inference loop
-  Future<void> _executeSimulatedInference() async {
-    if (!_isScanning) return;
-
-    final result = await mlService.processFrame(
-      forcedLandmarkKey: _activeSimulatedLandmarkKey,
-    );
-
-    _handleNewRecognition(result);
-  }
-
-  /// Manual snapshot scan (useful for taking a still photo to analyze)
-  Future<void> scanSnapshot() async {
-    if (_cameraService == null) return;
+  /// High-accuracy snapshot scan triggered by tapping the shutter/scan button
+  Future<RecognitionResult?> scanSnapshot() async {
+    if (_cameraService == null) return null;
     final bytes = await _cameraService!.captureFrameBytes();
     if (bytes != null) {
       final result = await mlService.processImageBytes(bytes);
-      if (result != null) {
-        _handleNewRecognition(result);
+      if (result != null && result.landmark != null && result.overallConfidence >= 0.85) {
+        _currentResult = result;
+        _candidateLabel = result.label;
+        _consecutiveHitCount = 2;
+        _simulatedDistance = result.landmark!.estimatedDistanceMeters;
+
+        if (_discoveryHistory.isEmpty ||
+            _discoveryHistory.first.label != result.label) {
+          _discoveryHistory.insert(0, result);
+          if (_discoveryHistory.length > 25) {
+            _discoveryHistory.removeLast();
+          }
+        }
+        notifyListeners();
+        return result;
+      } else {
+        // No monument detected in view -> turn off immediately!
+        _currentResult = null;
+        _candidateLabel = null;
+        _consecutiveHitCount = 0;
+        notifyListeners();
+        return null;
       }
     }
+    return null;
   }
 
   void _handleNewRecognition(RecognitionResult result) {
-    _currentResult = result;
+    final bool isLandmarkHit = result.landmark != null &&
+        result.overallConfidence >= mlService.confidenceThreshold;
 
-    if (result.landmark != null) {
-      _simulatedDistance = result.landmark!.estimatedDistanceMeters;
-    }
+    if (isLandmarkHit) {
+      if (result.label == _candidateLabel) {
+        _consecutiveHitCount++;
+      } else {
+        _candidateLabel = result.label;
+        _consecutiveHitCount = 1;
+      }
 
-    // Record landmark discovery if confidence is high and distinct from the last entry
-    if (result.overallConfidence >= 0.55 && result.landmark != null) {
-      if (_discoveryHistory.isEmpty ||
-          _discoveryHistory.first.label != result.label) {
-        _discoveryHistory.insert(0, result);
-        if (_discoveryHistory.length > 20) {
-          _discoveryHistory.removeLast();
+      // Require 2 consecutive confident hits to prevent single-frame false triggers
+      if (_consecutiveHitCount >= _requiredConsecutiveHits) {
+        final bool isFirstLock = _currentResult?.landmark == null ||
+            _currentResult?.label != result.label;
+        _currentResult = result;
+        _simulatedDistance = result.landmark!.estimatedDistanceMeters;
+
+        if (isFirstLock) {
+          if (_discoveryHistory.isEmpty ||
+              _discoveryHistory.first.label != result.label) {
+            _discoveryHistory.insert(0, result);
+            if (_discoveryHistory.length > 25) {
+              _discoveryHistory.removeLast();
+            }
+          }
         }
+        notifyListeners();
+      }
+    } else {
+      _candidateLabel = null;
+      _consecutiveHitCount = 0;
+
+      // When pointing at desk, floor, or away from monument: IMMEDIATELY TURN OFF!
+      if (_currentResult != null) {
+        _currentResult = null;
+        notifyListeners();
       }
     }
-
-    notifyListeners();
-  }
-
-  void setActiveLandmark(String landmarkKey) {
-    _activeSimulatedLandmarkKey = landmarkKey;
-    final landmark = LandmarkDataService.findByLabel(landmarkKey);
-    if (landmark != null) {
-      _simulatedDistance = landmark.estimatedDistanceMeters;
-    }
-    notifyListeners();
   }
 
   void setSimulatedTelemetry({
@@ -175,7 +237,7 @@ class ScannerProvider extends ChangeNotifier {
 
   @override
   void dispose() {
-    _scanTimer?.cancel();
+    _cameraService?.removeListener(_onCameraStateChanged);
     _cameraService?.stopImageStream();
     super.dispose();
   }

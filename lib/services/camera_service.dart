@@ -23,6 +23,7 @@ class CameraService extends ChangeNotifier {
   CameraFeedMode get feedMode => _feedMode;
   String get errorMessage => _errorMessage;
   bool get isLiveCamera => _feedMode == CameraFeedMode.liveCamera && _isInitialized;
+  int get sensorOrientation => _controller?.description.sensorOrientation ?? 90;
 
   Future<void> initialize() async {
     try {

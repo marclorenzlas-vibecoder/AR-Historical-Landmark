@@ -38,6 +38,7 @@ class RecognitionResult {
   final int inferenceTimeMs;
   final Landmark? landmark;
   final DateTime detectedAt;
+  final Map<String, double> allProbabilities;
 
   RecognitionResult({
     required this.label,
@@ -47,6 +48,7 @@ class RecognitionResult {
     required this.inferenceTimeMs,
     this.landmark,
     DateTime? detectedAt,
+    this.allProbabilities = const {},
   }) : detectedAt = detectedAt ?? DateTime.now();
 
   double get overallConfidence => (yoloConfidence * 0.4) + (cnnConfidence * 0.6);
