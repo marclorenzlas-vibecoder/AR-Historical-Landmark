@@ -4,7 +4,7 @@
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <application
-        android:label="ar_landmark"
+        android:label="ARcVision"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

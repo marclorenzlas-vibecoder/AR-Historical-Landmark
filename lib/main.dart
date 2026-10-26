@@ -58,7 +58,7 @@ class ARLandmarkApp extends StatelessWidget {
     final baseTextTheme = ThemeData.dark().textTheme;
 
     return MaterialApp(
-      title: 'Heritage AR - Historical Landmark Explorer',
+      title: 'ARcVision',
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
       theme: ThemeData(

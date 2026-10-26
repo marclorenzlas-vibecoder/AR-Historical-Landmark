@@ -42,7 +42,9 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
         fit: StackFit.expand,
         children: [
           // 1. Live Camera Feed (Fixed aspect ratio without stretching/distortion)
-          if (cameraService.isLiveCamera && cameraService.controller != null)
+          if (cameraService.isLiveCamera &&
+              cameraService.controller != null &&
+              cameraService.controller!.value.isInitialized)
             _buildUnstretchedCameraPreview(cameraService.controller!, context)
           else
             _buildCameraLoadingViewport(),
@@ -165,10 +167,10 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
             ),
             const SizedBox(height: 20),
             Text(
-              'HERITAGE AR SCANNER',
+              'ARcVision',
               style: GoogleFonts.playfairDisplay(
                 color: const Color(0xFFF7EBE1),
-                fontSize: 18,
+                fontSize: 20,
                 fontWeight: FontWeight.bold,
                 letterSpacing: 1.2,
               ),

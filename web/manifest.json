@@ -1,6 +1,6 @@
 {
-    "name": "ar_landmark",
-    "short_name": "ar_landmark",
+    "name": "ARcVision",
+    "short_name": "ARcVision",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
