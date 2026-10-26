@@ -194,9 +194,6 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
   ) {
     final res = scanner.currentResult;
     final hasLandmark = res?.landmark != null;
-    final matchPct = hasLandmark
-        ? ((res!.overallConfidence * 100).toStringAsFixed(0))
-        : null;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -213,6 +210,7 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
         ],
       ),
       child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           // Left: Heading Telemetry
           Row(
@@ -231,9 +229,7 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
             ],
           ),
 
-          const Spacer(),
-
-          // Center: Live Status Chip
+          // Right: Live Recognition Status Chip
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
             decoration: BoxDecoration(
@@ -271,74 +267,6 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
                   ),
                 ),
               ],
-            ),
-          ),
-
-          const Spacer(),
-
-          // Right: AI Strictness & Confidence Tuning
-          GestureDetector(
-            onTap: () => _showStrictnessModal(context, scanner),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: const Color(0xFFD4AF37).withValues(alpha: 0.15),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFFD4AF37).withValues(alpha: 0.5)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.tune, color: Color(0xFFE5C158), size: 13),
-                  const SizedBox(width: 4),
-                  Text(
-                    matchPct != null
-                        ? 'AI $matchPct% • ${(scanner.confidenceThreshold * 100).toStringAsFixed(0)}%'
-                        : 'STRICT ${(scanner.confidenceThreshold * 100).toStringAsFixed(0)}%',
-                    style: GoogleFonts.outfit(
-                      color: const Color(0xFFFFF0B8),
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-
-          const SizedBox(width: 6),
-
-          // Direct Photo Tester Shortcut
-          GestureDetector(
-            onTap: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => const PhotoTestScreen(),
-                ),
-              );
-            },
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              decoration: BoxDecoration(
-                color: const Color(0xFFFFE600).withValues(alpha: 0.18),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: const Color(0xFFFFE600).withValues(alpha: 0.6)),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.add_photo_alternate, color: Color(0xFFFFE600), size: 14),
-                  const SizedBox(width: 4),
-                  Text(
-                    'TEST',
-                    style: GoogleFonts.outfit(
-                      color: const Color(0xFFFFE600),
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ],
-              ),
             ),
           ),
         ],
@@ -624,40 +552,6 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
             ),
           ),
 
-          // 4. Discovery Log / Field Notes (Showing detected landmarks)
-          Stack(
-            clipBehavior: Clip.none,
-            children: [
-              _buildDockButton(
-                icon: Icons.history_edu,
-                label: 'Notes',
-                color: const Color(0xFFF7EBE1),
-                onTap: () => _showHistorySheet(context, scanner),
-              ),
-              if (scanner.discoveryHistory.isNotEmpty)
-                Positioned(
-                  right: 4,
-                  top: -2,
-                  child: Container(
-                    padding: const EdgeInsets.all(4),
-                    decoration: const BoxDecoration(
-                      color: Color(0xFFD4AF37),
-                      shape: BoxShape.circle,
-                    ),
-                    constraints: const BoxConstraints(minWidth: 16, minHeight: 16),
-                    child: Text(
-                      '${scanner.discoveryHistory.length}',
-                      style: GoogleFonts.outfit(
-                        color: Colors.black,
-                        fontSize: 9,
-                        fontWeight: FontWeight.bold,
-                      ),
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
-                ),
-            ],
-          ),
 
           // 5. Test with Photo Upload (Gallery / Sample tester)
           _buildDockButton(
@@ -1198,121 +1092,5 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
     );
   }
 
-  void _showHistorySheet(BuildContext context, ScannerProvider scanner) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF1C1814),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-      ),
-      builder: (_) {
-        final history = scanner.discoveryHistory;
 
-        return Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.history_edu, color: Color(0xFFD4AF37)),
-                  const SizedBox(width: 10),
-                  Text(
-                    'Field Discovery Log',
-                    style: GoogleFonts.playfairDisplay(
-                      color: const Color(0xFFF7EBE1),
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const Spacer(),
-                  if (history.isNotEmpty)
-                    TextButton(
-                      onPressed: () {
-                        scanner.clearHistory();
-                        Navigator.of(context).pop();
-                      },
-                      child: Text(
-                        'CLEAR',
-                        style: GoogleFonts.outfit(color: Colors.white54, fontSize: 11),
-                      ),
-                    ),
-                ],
-              ),
-              const SizedBox(height: 14),
-              if (history.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 24),
-                  child: Center(
-                    child: Text(
-                      'No monuments detected yet.\nPoint your camera lens at Cathedral, LCCB, or Public Plaza!',
-                      textAlign: TextAlign.center,
-                      style: GoogleFonts.outfit(color: const Color(0xFFAFA397), fontSize: 13),
-                    ),
-                  ),
-                )
-              else
-                Flexible(
-                  child: ListView.builder(
-                    shrinkWrap: true,
-                    itemCount: history.length,
-                    itemBuilder: (context, index) {
-                      final item = history[index];
-                      final landmark = item.landmark;
-                      if (landmark == null) return const SizedBox();
-
-                      return ListTile(
-                        leading: ClipRRect(
-                          borderRadius: BorderRadius.circular(8),
-                          child: SizedBox(
-                            width: 48,
-                            height: 48,
-                            child: Image.asset(
-                              landmark.imageAsset,
-                              fit: BoxFit.cover,
-                              errorBuilder: (_, _, _) => Container(
-                                color: const Color(0xFF28221B),
-                                child: const Icon(Icons.account_balance, color: Color(0xFFD4AF37)),
-                              ),
-                            ),
-                          ),
-                        ),
-                        title: Text(
-                          landmark.name,
-                          style: GoogleFonts.playfairDisplay(
-                            color: const Color(0xFFF7EBE1),
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        subtitle: Text(
-                          '${landmark.country} • ${(item.overallConfidence * 100).toStringAsFixed(0)}% Match',
-                          style: GoogleFonts.outfit(
-                            color: const Color(0xFFC7B9AC),
-                            fontSize: 12,
-                          ),
-                        ),
-                        trailing: const Icon(
-                          Icons.arrow_forward_ios,
-                          color: Color(0xFFD4AF37),
-                          size: 14,
-                        ),
-                        onTap: () {
-                          Navigator.of(context).pop();
-                          Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => LandmarkDetailScreen(landmark: landmark),
-                            ),
-                          );
-                        },
-                      );
-                    },
-                  ),
-                ),
-            ],
-          ),
-        );
-      },
-    );
-  }
 }
