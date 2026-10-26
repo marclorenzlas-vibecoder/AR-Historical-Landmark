@@ -34,7 +34,7 @@ class RecognitionResult {
   final String label;
   final double yoloConfidence;
   final double cnnConfidence;
-  final BoundingBox boundingBox;
+  final BoundingBox? boundingBox;
   final int inferenceTimeMs;
   final Landmark? landmark;
   final DateTime detectedAt;
@@ -43,7 +43,7 @@ class RecognitionResult {
     required this.label,
     required this.yoloConfidence,
     required this.cnnConfidence,
-    required this.boundingBox,
+    this.boundingBox,
     required this.inferenceTimeMs,
     this.landmark,
     DateTime? detectedAt,

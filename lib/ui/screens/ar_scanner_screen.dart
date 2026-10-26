@@ -19,6 +19,18 @@ class ARScannerScreen extends StatefulWidget {
 
 class _ARScannerScreenState extends State<ARScannerScreen> {
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        final camera = Provider.of<CameraService>(context, listen: false);
+        final scanner = Provider.of<ScannerProvider>(context, listen: false);
+        scanner.bindCameraService(camera);
+      }
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
     final cameraService = Provider.of<CameraService>(context);
     final scanner = Provider.of<ScannerProvider>(context);

@@ -12,12 +12,14 @@ class CameraService extends ChangeNotifier {
   int _selectedCameraIndex = 0;
   bool _isInitialized = false;
   bool _isFlashOn = false;
+  bool _isStreaming = false;
   CameraFeedMode _feedMode = CameraFeedMode.simulatedView;
   String _errorMessage = '';
 
   CameraController? get controller => _controller;
   bool get isInitialized => _isInitialized;
   bool get isFlashOn => _isFlashOn;
+  bool get isStreaming => _isStreaming;
   CameraFeedMode get feedMode => _feedMode;
   String get errorMessage => _errorMessage;
   bool get isLiveCamera => _feedMode == CameraFeedMode.liveCamera && _isInitialized;
@@ -46,12 +48,22 @@ class CameraService extends ChangeNotifier {
   }
 
   Future<void> _initController(CameraDescription description) async {
+    if (_isStreaming) {
+      await stopImageStream();
+    }
     await _controller?.dispose();
+
+    final imageFormat = defaultTargetPlatform == TargetPlatform.android
+        ? ImageFormatGroup.yuv420
+        : (defaultTargetPlatform == TargetPlatform.iOS
+            ? ImageFormatGroup.bgra8888
+            : ImageFormatGroup.jpeg);
+
     _controller = CameraController(
       description,
-      ResolutionPreset.high,
+      ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.jpeg,
+      imageFormatGroup: imageFormat,
     );
 
     try {
@@ -59,6 +71,42 @@ class CameraService extends ChangeNotifier {
     } catch (e) {
       debugPrint('Camera controller init error: $e');
       _feedMode = CameraFeedMode.simulatedView;
+    }
+  }
+
+  Future<void> startImageStream(Function(CameraImage image) onImage) async {
+    if (_controller == null || !_controller!.value.isInitialized) return;
+    if (_isStreaming) return;
+    try {
+      _isStreaming = true;
+      await _controller!.startImageStream(onImage);
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Error starting camera image stream: $e');
+      _isStreaming = false;
+    }
+  }
+
+  Future<void> stopImageStream() async {
+    if (_controller == null || !_controller!.value.isInitialized) return;
+    if (!_isStreaming) return;
+    try {
+      _isStreaming = false;
+      await _controller!.stopImageStream();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Error stopping camera image stream: $e');
+    }
+  }
+
+  Future<Uint8List?> captureFrameBytes() async {
+    if (_controller == null || !_controller!.value.isInitialized) return null;
+    try {
+      final file = await _controller!.takePicture();
+      return await file.readAsBytes();
+    } catch (e) {
+      debugPrint('Error capturing frame snapshot: $e');
+      return null;
     }
   }
 
@@ -77,6 +125,9 @@ class CameraService extends ChangeNotifier {
 
   Future<void> switchCamera() async {
     if (_cameras.length <= 1) return;
+    if (_isStreaming) {
+      await stopImageStream();
+    }
     _selectedCameraIndex = (_selectedCameraIndex + 1) % _cameras.length;
     await _initController(_cameras[_selectedCameraIndex]);
     notifyListeners();
@@ -89,6 +140,9 @@ class CameraService extends ChangeNotifier {
 
   @override
   void dispose() {
+    if (_isStreaming) {
+      _controller?.stopImageStream();
+    }
     _controller?.dispose();
     super.dispose();
   }

@@ -33,7 +33,10 @@ void main() async {
         ChangeNotifierProvider<MLService>.value(value: mlService),
         ChangeNotifierProvider<CameraService>.value(value: cameraService),
         ChangeNotifierProvider<ScannerProvider>(
-          create: (_) => ScannerProvider(mlService: mlService),
+          create: (_) => ScannerProvider(
+            mlService: mlService,
+            cameraService: cameraService,
+          ),
         ),
       ],
       child: const ARLandmarkApp(),

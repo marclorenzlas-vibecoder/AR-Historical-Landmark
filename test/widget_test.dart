@@ -22,4 +22,18 @@ void main() {
     expect(box.centerX, closeTo(0.3, 0.001));
     expect(box.centerY, closeTo(0.4, 0.001));
   });
+
+  test('LandmarkDataService resolves cathedral, lccb, and plaza', () {
+    final cathedral = LandmarkDataService.findByLabel('cathedral');
+    expect(cathedral, isNotNull);
+    expect(cathedral!.name, contains('Cathedral'));
+
+    final lccb = LandmarkDataService.findByLabel('lccb');
+    expect(lccb, isNotNull);
+    expect(lccb!.name, contains('La Consolacion'));
+
+    final plaza = LandmarkDataService.findByLabel('plaza');
+    expect(plaza, isNotNull);
+    expect(plaza!.name, contains('Plaza'));
+  });
 }
