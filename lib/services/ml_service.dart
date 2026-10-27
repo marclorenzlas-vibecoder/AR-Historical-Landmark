@@ -4,7 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'tflite_adapter/tflite_adapter.dart' as tflite;
-import 'tflite_adapter/tflite_adapter.dart' show Interpreter;
+import 'tflite_adapter/tflite_adapter.dart' show Interpreter, InterpreterOptions, IsolateInterpreter;
 import '../models/landmark.dart';
 import 'landmark_data_service.dart';
 
@@ -15,6 +15,7 @@ enum MLInferenceMode {
 
 class MLService extends ChangeNotifier {
   Interpreter? _interpreter;
+  IsolateInterpreter? _isolateInterpreter;
   tflite.Interpreter? _yoloInterpreter;
   tflite.Interpreter? _cnnInterpreter;
   List<String> _labels = [];
@@ -22,6 +23,13 @@ class MLService extends ChangeNotifier {
   MLInferenceMode _mode = MLInferenceMode.simulationEngine;
   String _statusMessage = 'Initializing ML Core...';
   int _lastInferenceTimeMs = 24;
+
+  // Pre-allocated coordinate lookup tables to avoid 50,000 float & round operations per frame
+  final Int32List _srcXTable = Int32List(224);
+  final Int32List _srcYTable = Int32List(224);
+  int _cachedWidth = 0;
+  int _cachedHeight = 0;
+  int _cachedOrientation = -1;
 
   // Reusable 4D tensor buffer to eliminate 50,000 List allocations per camera frame
   final List<List<List<List<double>>>> _inputTensorBuffer = List.generate(
@@ -81,19 +89,29 @@ class MLService extends ChangeNotifier {
         }
       }
 
-      // 2. Load TFLite model directly from model/model.tflite
+      // 2. Load TFLite model directly from model/model.tflite with multi-threaded hardware options
       bool modelLoaded = false;
+      final options = InterpreterOptions()..threads = 2;
       try {
-        _interpreter = await Interpreter.fromAsset('model/model.tflite');
+        _interpreter = await Interpreter.fromAsset('model/model.tflite', options: options);
         _cnnInterpreter ??= _interpreter;
         modelLoaded = true;
       } catch (e) {
         try {
-          _interpreter = await Interpreter.fromAsset('assets/models/model.tflite');
+          _interpreter = await Interpreter.fromAsset('assets/models/model.tflite', options: options);
           _cnnInterpreter ??= _interpreter;
           modelLoaded = true;
         } catch (e2) {
           debugPrint('Model model.tflite not found or not supported on this platform: $e2');
+        }
+      }
+
+      if (modelLoaded && _interpreter != null) {
+        try {
+          _isolateInterpreter = await IsolateInterpreter.create(address: _interpreter!.address);
+          debugPrint('IsolateInterpreter created for background inference execution.');
+        } catch (e) {
+          debugPrint('IsolateInterpreter creation notice: $e');
         }
       }
 
@@ -173,8 +191,12 @@ class MLService extends ChangeNotifier {
       final numClasses = _labels.isNotEmpty ? _labels.length : 3;
       final output = List.generate(1, (_) => List.filled(numClasses, 0.0));
 
-      // 3. Run hardware on-device inference
-      activeInterpreter.run(input, output);
+      // 3. Run hardware on-device inference (uses background isolate to eliminate UI lag)
+      if (_isolateInterpreter != null) {
+        await _isolateInterpreter!.run(input, output);
+      } else {
+        activeInterpreter.run(input, output);
+      }
 
       stopwatch.stop();
       _lastInferenceTimeMs = max(8, stopwatch.elapsedMilliseconds);
@@ -303,6 +325,50 @@ class MLService extends ChangeNotifier {
     }
   }
 
+  void _updateCoordinateTables(int width, int height, int sensorOrientation) {
+    if (_cachedWidth == width &&
+        _cachedHeight == height &&
+        _cachedOrientation == sensorOrientation) {
+      return;
+    }
+    _cachedWidth = width;
+    _cachedHeight = height;
+    _cachedOrientation = sensorOrientation;
+
+    final int cropSize = min(width, height);
+    final double centerX = width / 2.0;
+    final double centerY = height / 2.0;
+
+    const int targetW = 224;
+    const int targetH = 224;
+
+    for (int outY = 0; outY < targetH; outY++) {
+      final double v = (outY + 0.5) / targetH;
+      if (sensorOrientation == 90) {
+        _srcXTable[outY] = (centerX + (v - 0.5) * cropSize).round().clamp(0, width - 1);
+      } else if (sensorOrientation == 270) {
+        _srcXTable[outY] = (centerX + (0.5 - v) * cropSize).round().clamp(0, width - 1);
+      } else if (sensorOrientation == 180) {
+        _srcXTable[outY] = (centerX + (0.5 - v) * cropSize).round().clamp(0, width - 1);
+      } else {
+        _srcXTable[outY] = (centerX + (v - 0.5) * cropSize).round().clamp(0, width - 1);
+      }
+    }
+
+    for (int outX = 0; outX < targetW; outX++) {
+      final double u = (outX + 0.5) / targetW;
+      if (sensorOrientation == 90) {
+        _srcYTable[outX] = (centerY + (0.5 - u) * cropSize).round().clamp(0, height - 1);
+      } else if (sensorOrientation == 270) {
+        _srcYTable[outX] = (centerY + (u - 0.5) * cropSize).round().clamp(0, height - 1);
+      } else if (sensorOrientation == 180) {
+        _srcYTable[outX] = (centerY + (0.5 - u) * cropSize).round().clamp(0, height - 1);
+      } else {
+        _srcYTable[outX] = (centerY + (u - 0.5) * cropSize).round().clamp(0, height - 1);
+      }
+    }
+  }
+
   /// Extracts and rotates the central Target Frame to an upright [1, 224, 224, 3] Float tensor in [0.0, 255.0]
   List<List<List<List<double>>>> _preprocessCameraImage(
     CameraImage image,
@@ -313,10 +379,7 @@ class MLService extends ChangeNotifier {
     final int width = image.width;
     final int height = image.height;
 
-    // Crop the central square of the camera sensor
-    final int cropSize = min(width, height);
-    final double centerX = width / 2.0;
-    final double centerY = height / 2.0;
+    _updateCoordinateTables(width, height, sensorOrientation);
 
     // Android YUV420 format
     if (image.format.group == ImageFormatGroup.yuv420 || image.planes.length >= 3) {
@@ -324,52 +387,38 @@ class MLService extends ChangeNotifier {
       final Plane uPlane = image.planes[1];
       final Plane vPlane = image.planes[2];
 
+      final Uint8List yBytes = yPlane.bytes;
+      final Uint8List uBytes = uPlane.bytes;
+      final Uint8List vBytes = vPlane.bytes;
+
+      final int yLength = yBytes.length;
+      final int uLength = uBytes.length;
+      final int vLength = vBytes.length;
+
       final int yRowStride = yPlane.bytesPerRow;
       final int uvRowStride = uPlane.bytesPerRow;
       final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
+      final int vRowStride = vPlane.bytesPerRow;
       final int vPixelStride = vPlane.bytesPerPixel ?? 1;
 
       for (int outY = 0; outY < targetH; outY++) {
-        final double v = (outY + 0.5) / targetH; // 0..1 from top to bottom of screen in portrait
+        final int srcX = _srcXTable[outY];
+        final int uvX = srcX >> 1;
+        final int uColOffset = uvX * uvPixelStride;
+        final int vColOffset = uvX * vPixelStride;
         final row = _inputTensorBuffer[0][outY];
+
         for (int outX = 0; outX < targetW; outX++) {
-          final double u = (outX + 0.5) / targetW; // 0..1 from left to right of screen in portrait
-
-          int srcX;
-          int srcY;
-
-          // Rotate sensor pixels to be UPRIGHT in portrait mode
-          if (sensorOrientation == 90) {
-            // 90 deg CW on Android back camera:
-            // Screen down (+v) is sensor right (+X)
-            // Screen right (+u) is sensor top (-Y)
-            srcX = (centerX + (v - 0.5) * cropSize).round().clamp(0, width - 1);
-            srcY = (centerY + (0.5 - u) * cropSize).round().clamp(0, height - 1);
-          } else if (sensorOrientation == 270) {
-            srcX = (centerX + (0.5 - v) * cropSize).round().clamp(0, width - 1);
-            srcY = (centerY + (u - 0.5) * cropSize).round().clamp(0, height - 1);
-          } else if (sensorOrientation == 180) {
-            srcX = (centerX + (0.5 - u) * cropSize).round().clamp(0, width - 1);
-            srcY = (centerY + (0.5 - v) * cropSize).round().clamp(0, height - 1);
-          } else {
-            srcX = (centerX + (u - 0.5) * cropSize).round().clamp(0, width - 1);
-            srcY = (centerY + (v - 0.5) * cropSize).round().clamp(0, height - 1);
-          }
-
-          final int uvX = srcX ~/ 2;
-          final int uvY = srcY ~/ 2;
+          final int srcY = _srcYTable[outX];
+          final int uvY = srcY >> 1;
 
           final int yIndex = srcY * yRowStride + srcX;
-          final int uIndex = uvY * uvRowStride + uvX * uvPixelStride;
-          final int vIndex = uvY * vPlane.bytesPerRow + uvX * vPixelStride;
+          final int uIndex = uvY * uvRowStride + uColOffset;
+          final int vIndex = uvY * vRowStride + vColOffset;
 
-          final int yVal = (yIndex < yPlane.bytes.length) ? yPlane.bytes[yIndex] : 0;
-          final int uVal = (uIndex >= 0 && uIndex < uPlane.bytes.length)
-              ? uPlane.bytes[uIndex] - 128
-              : 0;
-          final int vVal = (vIndex >= 0 && vIndex < vPlane.bytes.length)
-              ? vPlane.bytes[vIndex] - 128
-              : 0;
+          final int yVal = (yIndex < yLength) ? yBytes[yIndex] : 0;
+          final int uVal = (uIndex >= 0 && uIndex < uLength) ? uBytes[uIndex] - 128 : 0;
+          final int vVal = (vIndex >= 0 && vIndex < vLength) ? vBytes[vIndex] - 128 : 0;
 
           final double r = (yVal + 1.402 * vVal).clamp(0.0, 255.0);
           final double g = (yVal - 0.344136 * uVal - 0.714136 * vVal).clamp(0.0, 255.0);
@@ -389,30 +438,18 @@ class MLService extends ChangeNotifier {
       final plane = image.planes[0];
       final bytes = plane.bytes;
       final int bytesPerRow = plane.bytesPerRow;
+      final int bytesLength = bytes.length;
 
       for (int outY = 0; outY < targetH; outY++) {
-        final double v = (outY + 0.5) / targetH;
+        final int srcX = _srcXTable[outY];
         final row = _inputTensorBuffer[0][outY];
+
         for (int outX = 0; outX < targetW; outX++) {
-          final double u = (outX + 0.5) / targetW;
-
-          int srcX;
-          int srcY;
-
-          if (sensorOrientation == 90) {
-            srcX = (centerX + (v - 0.5) * cropSize).round().clamp(0, width - 1);
-            srcY = (centerY + (0.5 - u) * cropSize).round().clamp(0, height - 1);
-          } else if (sensorOrientation == 270) {
-            srcX = (centerX + (0.5 - v) * cropSize).round().clamp(0, width - 1);
-            srcY = (centerY + (u - 0.5) * cropSize).round().clamp(0, height - 1);
-          } else {
-            srcX = (centerX + (u - 0.5) * cropSize).round().clamp(0, width - 1);
-            srcY = (centerY + (v - 0.5) * cropSize).round().clamp(0, height - 1);
-          }
-
-          final int index = srcY * bytesPerRow + srcX * 4;
+          final int srcY = _srcYTable[outX];
+          final int index = srcY * bytesPerRow + (srcX << 2);
           final pixel = row[outX];
-          if (index + 2 < bytes.length) {
+
+          if (index + 2 < bytesLength) {
             pixel[0] = bytes[index + 2].toDouble();
             pixel[1] = bytes[index + 1].toDouble();
             pixel[2] = bytes[index].toDouble();
@@ -682,6 +719,7 @@ class MLService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _isolateInterpreter?.close();
     _interpreter?.close();
     _yoloInterpreter?.close();
     _cnnInterpreter?.close();

@@ -115,9 +115,10 @@ class ScannerProvider extends ChangeNotifier {
   void _onCameraFrame(CameraImage image) async {
     if (!_isScanning || _isProcessingFrame) return;
 
-    // Pace inferences to ~5-6 per second (170ms interval) to keep UI smooth and 60fps
+    // Pace inferences to ~3 inferences per second (320ms interval).
+    // This gives near-instant landmark recognition while keeping camera feed locked at a silky-smooth 60fps.
     final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - _lastFrameTimestamp < 170) {
+    if (now - _lastFrameTimestamp < 320) {
       return;
     }
     _lastFrameTimestamp = now;

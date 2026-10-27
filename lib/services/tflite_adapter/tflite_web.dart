@@ -12,6 +12,19 @@ class Interpreter {
     );
   }
 
+  int get address => 0;
   void run(Object input, Object output) {}
+  void close() {}
+}
+
+class IsolateInterpreter {
+  static Future<IsolateInterpreter> create({
+    required int address,
+    String debugName = 'TfLiteInterpreterIsolate',
+  }) async {
+    return IsolateInterpreter();
+  }
+
+  Future<void> run(Object input, Object output) async {}
   void close() {}
 }

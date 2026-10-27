@@ -502,60 +502,7 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
             onTap: () => cameraService.switchCamera(),
           ),
 
-          // 3. Central Snap / Scan Shutter Button (Accurate on-demand snapshot)
-          GestureDetector(
-            onTap: () async {
-              final result = await scanner.scanSnapshot();
-              if (context.mounted && result?.landmark == null) {
-                ScaffoldMessenger.of(context).clearSnackBars();
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(
-                    backgroundColor: const Color(0xFF28221B),
-                    behavior: SnackBarBehavior.floating,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    duration: const Duration(seconds: 2),
-                    content: Row(
-                      children: [
-                        const Icon(Icons.info_outline, color: Color(0xFFD4AF37), size: 18),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            'No landmark detected in view. Point camera at Cathedral, LCCB, or Plaza.',
-                            style: GoogleFonts.outfit(color: Colors.white, fontSize: 12),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              }
-            },
-            child: Container(
-              width: 58,
-              height: 58,
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [Color(0xFFE5C158), Color(0xFFC59B27)],
-                ),
-                shape: BoxShape.circle,
-                boxShadow: [
-                  BoxShadow(
-                    color: const Color(0xFFD4AF37).withValues(alpha: 0.5),
-                    blurRadius: 14,
-                    spreadRadius: 1,
-                  ),
-                ],
-              ),
-              child: const Icon(
-                Icons.camera_alt,
-                color: Colors.black,
-                size: 28,
-              ),
-            ),
-          ),
-
-
-          // 5. Test with Photo Upload (Gallery / Sample tester)
+          // 3. Test with Photo Upload (Gallery / Sample tester)
           _buildDockButton(
             icon: Icons.add_photo_alternate,
             label: 'Test Photo',
