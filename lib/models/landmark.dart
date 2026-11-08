@@ -27,6 +27,51 @@ class BoundingBox {
       bottom * screenSize.height,
     );
   }
+
+  /// Maps normalized [0.0..1.0] image coordinates to widget coordinates
+  /// accounting for [BoxFit] (e.g. BoxFit.cover for live camera, BoxFit.contain for static photos),
+  /// matching its411yolo's BoxMapper behavior so the outline follows the object 1:1.
+  Rect toFittedRect({
+    required Size imageSize,
+    required Size widgetSize,
+    BoxFit fit = BoxFit.cover,
+  }) {
+    if (imageSize.isEmpty ||
+        widgetSize.isEmpty ||
+        imageSize.width <= 0 ||
+        imageSize.height <= 0) {
+      return toRect(widgetSize);
+    }
+
+    double scaleX = widgetSize.width / imageSize.width;
+    double scaleY = widgetSize.height / imageSize.height;
+
+    if (fit == BoxFit.cover) {
+      final double scale = scaleX > scaleY ? scaleX : scaleY;
+      scaleX = scale;
+      scaleY = scale;
+    } else if (fit == BoxFit.contain) {
+      final double scale = scaleX < scaleY ? scaleX : scaleY;
+      scaleX = scale;
+      scaleY = scale;
+    }
+
+    final double scaledW = imageSize.width * scaleX;
+    final double scaledH = imageSize.height * scaleY;
+    final double offsetX = (widgetSize.width - scaledW) / 2.0;
+    final double offsetY = (widgetSize.height - scaledH) / 2.0;
+
+    final double mappedLeft =
+        (offsetX + left * scaledW).clamp(4.0, widgetSize.width - 24.0);
+    final double mappedTop =
+        (offsetY + top * scaledH).clamp(28.0, widgetSize.height - 24.0);
+    final double mappedRight =
+        (offsetX + right * scaledW).clamp(mappedLeft + 20.0, widgetSize.width - 4.0);
+    final double mappedBottom =
+        (offsetY + bottom * scaledH).clamp(mappedTop + 20.0, widgetSize.height - 4.0);
+
+    return Rect.fromLTRB(mappedLeft, mappedTop, mappedRight, mappedBottom);
+  }
 }
 
 /// Result of the dual YOLO + CNN detection pipeline
@@ -35,6 +80,7 @@ class RecognitionResult {
   final double yoloConfidence;
   final double cnnConfidence;
   final BoundingBox? boundingBox;
+  final Size imageSize;
   final int inferenceTimeMs;
   final Landmark? landmark;
   final DateTime detectedAt;
@@ -45,6 +91,7 @@ class RecognitionResult {
     required this.yoloConfidence,
     required this.cnnConfidence,
     this.boundingBox,
+    this.imageSize = Size.zero,
     required this.inferenceTimeMs,
     this.landmark,
     DateTime? detectedAt,

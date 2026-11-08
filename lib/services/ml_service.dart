@@ -24,12 +24,28 @@ class MLService extends ChangeNotifier {
   String _statusMessage = 'Initializing ML Core...';
   int _lastInferenceTimeMs = 24;
 
-  // Pre-allocated coordinate lookup tables to avoid 50,000 float & round operations per frame
+  // Pre-allocated coordinate lookup tables for 224x224 CNN crop
   final Int32List _srcXTable = Int32List(224);
   final Int32List _srcYTable = Int32List(224);
-  int _cachedWidth = 0;
-  int _cachedHeight = 0;
-  int _cachedOrientation = -1;
+
+  // Pre-allocated 64x64 full-frame spatial localization buffers (zero GC pressure per frame)
+  static const int _gridSize = 64;
+  static const int _gridCells = _gridSize * _gridSize;
+  final Float32List _gridR = Float32List(_gridCells);
+  final Float32List _gridG = Float32List(_gridCells);
+  final Float32List _gridB = Float32List(_gridCells);
+  final Float32List _rawSal = Float32List(_gridCells);
+  final Float32List _smoothSal = Float32List(_gridCells);
+  final Uint8List _visited = Uint8List(_gridCells);
+  final Int32List _bfsQueue = Int32List(_gridCells);
+  final Float32List _colWeight = Float32List(_gridSize);
+  final Float32List _rowWeight = Float32List(_gridSize);
+
+  // Real-time object tracking state (enables YOLO-style continuous box following)
+  BoundingBox? _trackedBox;
+  String? _lockedLandmarkKey;
+  double _lockedConfidence = 0.0;
+  int _framesSinceStrongHit = 0;
 
   // Reusable 4D tensor buffer to eliminate 50,000 List allocations per camera frame
   final List<List<List<List<double>>>> _inputTensorBuffer = List.generate(
@@ -43,7 +59,7 @@ class MLService extends ChangeNotifier {
     ),
   );
 
-  double _confidenceThreshold = 0.96; // Default 96% strictness (turns off on non-monument backgrounds)
+  double _confidenceThreshold = 0.88; // Balanced default for fast lock & smooth tracking
 
   bool get isInitialized => _isInitialized;
   MLInferenceMode get mode => _mode;
@@ -63,6 +79,13 @@ class MLService extends ChangeNotifier {
 
   void setConfidenceThreshold(double value) {
     confidenceThreshold = value;
+  }
+
+  void resetTracking() {
+    _trackedBox = null;
+    _lockedLandmarkKey = null;
+    _lockedConfidence = 0.0;
+    _framesSinceStrongHit = 0;
   }
 
   Future<void> initialize() async {
@@ -133,7 +156,7 @@ class MLService extends ChangeNotifier {
     }
   }
 
-  /// Process live camera frame with TFLite model and return detected landmark
+  /// Process live camera frame with Stage 1 Spatial Object Localization & Tracking + Stage 2 ROI CNN
   Future<RecognitionResult?> processCameraImage(
     CameraImage image, {
     int sensorOrientation = 90,
@@ -146,6 +169,11 @@ class MLService extends ChangeNotifier {
     final stopwatch = Stopwatch()..start();
 
     try {
+      final bool isRotated = sensorOrientation == 90 || sensorOrientation == 270;
+      final int uprightW = isRotated ? image.height : image.width;
+      final int uprightH = isRotated ? image.width : image.height;
+      final Size uprightImageSize = Size(uprightW.toDouble(), uprightH.toDouble());
+
       // 0. Quick scene texture check: avoid running model on flat walls, floors, ceilings, or covered lenses
       if (image.planes.isNotEmpty) {
         final Plane yPlane = image.planes[0];
@@ -165,13 +193,14 @@ class MLService extends ChangeNotifier {
             }
           }
         }
-        if ((maxLuma - minLuma) < 24) {
-          // Flat, uniform surface (wall, floor, table, dark room) - return searching immediately
+        if ((maxLuma - minLuma) < 22) {
+          resetTracking();
           return RecognitionResult(
             label: 'searching',
             yoloConfidence: 0.0,
             cnnConfidence: 0.0,
             boundingBox: null,
+            imageSize: uprightImageSize,
             inferenceTimeMs: 2,
             landmark: null,
             allProbabilities: const {},
@@ -179,31 +208,81 @@ class MLService extends ChangeNotifier {
         }
       }
 
-      // 1. Center crop and sample into 224x224 tensor rotated UPRIGHT matching device orientation
+      // 1. Stage 1 (YOLO-style Localization): Sample upright 64x64 frame & detect object bounding box
+      _extractUprightGridFromCamera(image, sensorOrientation);
+      final BoundingBox? detectedBox = _localizeObjectInGrid();
+
+      if (detectedBox == null) {
+        resetTracking();
+        return RecognitionResult(
+          label: 'searching',
+          yoloConfidence: 0.0,
+          cnnConfidence: 0.0,
+          boundingBox: null,
+          imageSize: uprightImageSize,
+          inferenceTimeMs: 4,
+          landmark: null,
+          allProbabilities: const {},
+        );
+      }
+
+      // Smoothly track the localized object box across frames so the outline follows the object
+      final BoundingBox smoothBox = _updateTrackedBox(detectedBox);
+
+      // 2. Stage 2 (ROI-Guided CNN): Sample 224x224 upright tensor centered on the tracked object
+      final double roiScale = (max(smoothBox.width, smoothBox.height) * 1.22).clamp(0.45, 1.0);
       final input = _preprocessCameraImage(
         image,
         224,
         224,
         sensorOrientation: sensorOrientation,
+        roiCenterU: smoothBox.centerX,
+        roiCenterV: smoothBox.centerY,
+        roiScale: roiScale,
       );
 
-      // 2. Prepare output tensor matching class count (default 3 classes: cathedral, lccb, plaza)
       final numClasses = _labels.isNotEmpty ? _labels.length : 3;
       final output = List.generate(1, (_) => List.filled(numClasses, 0.0));
 
-      // 3. Run hardware on-device inference (uses background isolate to eliminate UI lag)
       if (_isolateInterpreter != null) {
         await _isolateInterpreter!.run(input, output);
       } else {
         activeInterpreter.run(input, output);
       }
 
+      List<double> probabilities = _calculateSoftmax(output[0]);
+
+      // If ROI is significantly off-center or zoomed, also check full center crop when acquiring lock
+      if (_lockedLandmarkKey == null &&
+          ((smoothBox.centerX - 0.5).abs() > 0.12 ||
+              (smoothBox.centerY - 0.5).abs() > 0.12 ||
+              roiScale < 0.85)) {
+        final double roiBest = probabilities.reduce(max);
+        if (roiBest < _confidenceThreshold) {
+          final centerInput = _preprocessCameraImage(
+            image,
+            224,
+            224,
+            sensorOrientation: sensorOrientation,
+            roiCenterU: 0.5,
+            roiCenterV: 0.5,
+            roiScale: 1.0,
+          );
+          final centerOutput = List.generate(1, (_) => List.filled(numClasses, 0.0));
+          if (_isolateInterpreter != null) {
+            await _isolateInterpreter!.run(centerInput, centerOutput);
+          } else {
+            activeInterpreter.run(centerInput, centerOutput);
+          }
+          final centerProbs = _calculateSoftmax(centerOutput[0]);
+          if (centerProbs.reduce(max) > roiBest) {
+            probabilities = centerProbs;
+          }
+        }
+      }
+
       stopwatch.stop();
       _lastInferenceTimeMs = max(8, stopwatch.elapsedMilliseconds);
-
-      // 4. Calculate probabilities (handles both Softmax and raw Logits)
-      final rawScores = output[0];
-      List<double> probabilities = _calculateSoftmax(rawScores);
 
       int bestIdx = 0;
       double bestProb = probabilities[0];
@@ -219,35 +298,33 @@ class MLService extends ChangeNotifier {
         }
       }
 
-      // 5. Target Frame Classification Decision:
-      // Uses dynamic user-adjustable confidence threshold slider (default 96%)
-      final double effectiveThreshold = _confidenceThreshold;
-      final double effectiveMargin = (effectiveThreshold * 0.55).clamp(0.20, 0.70);
-      final bool isConfident = bestProb >= effectiveThreshold &&
-          (bestProb - secondProb) >= effectiveMargin &&
-          bestIdx >= 0 &&
-          bestIdx < _labels.length;
+      final Map<String, double> probMap = {};
+      for (int i = 0; i < probabilities.length && i < _labels.length; i++) {
+        probMap[_labels[i]] = probabilities[i];
+      }
 
-      if (isConfident) {
+      // 3. Decision & Continuous Object Tracking Hysteresis
+      final double acquireThreshold = _confidenceThreshold;
+      final double acquireMargin = (acquireThreshold * 0.45).clamp(0.18, 0.60);
+      final bool isStrongHit = bestIdx >= 0 &&
+          bestIdx < _labels.length &&
+          bestProb >= acquireThreshold &&
+          (bestProb - secondProb) >= acquireMargin;
+
+      if (isStrongHit) {
         final detectedKey = _labels[bestIdx];
         final landmark = LandmarkDataService.findByLabel(detectedKey);
-
         if (landmark != null) {
-          final box = _calculateLandmarkBoundingBox(
-            image,
-            detectedKey,
-            sensorOrientation,
-          );
-          final Map<String, double> probMap = {};
-          for (int i = 0; i < probabilities.length && i < _labels.length; i++) {
-            probMap[_labels[i]] = probabilities[i];
-          }
+          _lockedLandmarkKey = detectedKey;
+          _lockedConfidence = bestProb;
+          _framesSinceStrongHit = 0;
 
           return RecognitionResult(
             label: detectedKey,
             yoloConfidence: bestProb,
             cnnConfidence: bestProb,
-            boundingBox: box,
+            boundingBox: smoothBox,
+            imageSize: uprightImageSize,
             inferenceTimeMs: _lastInferenceTimeMs,
             landmark: landmark,
             allProbabilities: probMap,
@@ -255,17 +332,44 @@ class MLService extends ChangeNotifier {
         }
       }
 
-      final Map<String, double> probMap = {};
-      for (int i = 0; i < probabilities.length && i < _labels.length; i++) {
-        probMap[_labels[i]] = probabilities[i];
+      // If already locked onto a landmark, keep following the object seamlessly during camera pans/tilts
+      if (_lockedLandmarkKey != null) {
+        final int lockedIdx = _labels.indexOf(_lockedLandmarkKey!);
+        final double lockedClassProb =
+            (lockedIdx >= 0 && lockedIdx < probabilities.length) ? probabilities[lockedIdx] : 0.0;
+        final double trackContinuationThreshold = (acquireThreshold - 0.25).clamp(0.45, 0.75);
+
+        final bool continuesTracking =
+            (bestIdx == lockedIdx && lockedClassProb >= trackContinuationThreshold) ||
+                (_framesSinceStrongHit < 5 && lockedClassProb >= 0.38);
+
+        if (continuesTracking) {
+          _framesSinceStrongHit++;
+          _lockedConfidence = _lockedConfidence * 0.75 + max(lockedClassProb, bestProb) * 0.25;
+          final landmark = LandmarkDataService.findByLabel(_lockedLandmarkKey!);
+          if (landmark != null) {
+            return RecognitionResult(
+              label: _lockedLandmarkKey!,
+              yoloConfidence: _lockedConfidence,
+              cnnConfidence: _lockedConfidence,
+              boundingBox: smoothBox,
+              imageSize: uprightImageSize,
+              inferenceTimeMs: _lastInferenceTimeMs,
+              landmark: landmark,
+              allProbabilities: probMap,
+            );
+          }
+        } else {
+          resetTracking();
+        }
       }
 
-      // Target frame does not currently have a confident landmark match (searching)
       return RecognitionResult(
         label: 'searching',
         yoloConfidence: 0.0,
         cnnConfidence: 0.0,
         boundingBox: null,
+        imageSize: uprightImageSize,
         inferenceTimeMs: _lastInferenceTimeMs,
         landmark: null,
         allProbabilities: probMap,
@@ -274,6 +378,462 @@ class MLService extends ChangeNotifier {
       debugPrint('Real-time frame inference error: $e');
       return null;
     }
+  }
+
+  /// Samples the full upright camera frame into the 64x64 RGB grid for Stage 1 localization
+  void _extractUprightGridFromCamera(CameraImage image, int sensorOrientation) {
+    final int width = image.width;
+    final int height = image.height;
+
+    if (image.format.group == ImageFormatGroup.yuv420 || image.planes.length >= 3) {
+      final Plane yPlane = image.planes[0];
+      final Plane uPlane = image.planes[1];
+      final Plane vPlane = image.planes[2];
+
+      final Uint8List yBytes = yPlane.bytes;
+      final Uint8List uBytes = uPlane.bytes;
+      final Uint8List vBytes = vPlane.bytes;
+
+      final int yLen = yBytes.length;
+      final int uLen = uBytes.length;
+      final int vLen = vBytes.length;
+
+      final int yRowStride = yPlane.bytesPerRow;
+      final int uvRowStride = uPlane.bytesPerRow;
+      final int uvPixelStride = uPlane.bytesPerPixel ?? 1;
+      final int vRowStride = vPlane.bytesPerRow;
+      final int vPixelStride = vPlane.bytesPerPixel ?? 1;
+
+      for (int gy = 0; gy < _gridSize; gy++) {
+        final double v = (gy + 0.5) / _gridSize;
+        final int rowOffset = gy * _gridSize;
+
+        for (int gx = 0; gx < _gridSize; gx++) {
+          final double u = (gx + 0.5) / _gridSize;
+
+          int srcX;
+          int srcY;
+          if (sensorOrientation == 90) {
+            srcX = (v * (width - 1)).round().clamp(0, width - 1);
+            srcY = ((1.0 - u) * (height - 1)).round().clamp(0, height - 1);
+          } else if (sensorOrientation == 270) {
+            srcX = ((1.0 - v) * (width - 1)).round().clamp(0, width - 1);
+            srcY = (u * (height - 1)).round().clamp(0, height - 1);
+          } else if (sensorOrientation == 180) {
+            srcX = ((1.0 - u) * (width - 1)).round().clamp(0, width - 1);
+            srcY = ((1.0 - v) * (height - 1)).round().clamp(0, height - 1);
+          } else {
+            srcX = (u * (width - 1)).round().clamp(0, width - 1);
+            srcY = (v * (height - 1)).round().clamp(0, height - 1);
+          }
+
+          final int yIndex = srcY * yRowStride + srcX;
+          final int uvX = srcX >> 1;
+          final int uvY = srcY >> 1;
+          final int uIndex = uvY * uvRowStride + uvX * uvPixelStride;
+          final int vIndex = uvY * vRowStride + uvX * vPixelStride;
+
+          final int yVal = (yIndex >= 0 && yIndex < yLen) ? yBytes[yIndex] : 0;
+          final int uVal = (uIndex >= 0 && uIndex < uLen) ? uBytes[uIndex] - 128 : 0;
+          final int vVal = (vIndex >= 0 && vIndex < vLen) ? vBytes[vIndex] - 128 : 0;
+
+          final int cellIdx = rowOffset + gx;
+          _gridR[cellIdx] = (yVal + 1.402 * vVal).clamp(0.0, 255.0);
+          _gridG[cellIdx] = (yVal - 0.344136 * uVal - 0.714136 * vVal).clamp(0.0, 255.0);
+          _gridB[cellIdx] = (yVal + 1.772 * uVal).clamp(0.0, 255.0);
+        }
+      }
+      return;
+    }
+
+    if (image.format.group == ImageFormatGroup.bgra8888 || image.planes.length == 1) {
+      final plane = image.planes[0];
+      final bytes = plane.bytes;
+      final int bytesPerRow = plane.bytesPerRow;
+      final int bytesLen = bytes.length;
+
+      for (int gy = 0; gy < _gridSize; gy++) {
+        final double v = (gy + 0.5) / _gridSize;
+        final int rowOffset = gy * _gridSize;
+
+        for (int gx = 0; gx < _gridSize; gx++) {
+          final double u = (gx + 0.5) / _gridSize;
+
+          int srcX;
+          int srcY;
+          if (sensorOrientation == 90) {
+            srcX = (v * (width - 1)).round().clamp(0, width - 1);
+            srcY = ((1.0 - u) * (height - 1)).round().clamp(0, height - 1);
+          } else if (sensorOrientation == 270) {
+            srcX = ((1.0 - v) * (width - 1)).round().clamp(0, width - 1);
+            srcY = (u * (height - 1)).round().clamp(0, height - 1);
+          } else if (sensorOrientation == 180) {
+            srcX = ((1.0 - u) * (width - 1)).round().clamp(0, width - 1);
+            srcY = ((1.0 - v) * (height - 1)).round().clamp(0, height - 1);
+          } else {
+            srcX = (u * (width - 1)).round().clamp(0, width - 1);
+            srcY = (v * (height - 1)).round().clamp(0, height - 1);
+          }
+
+          final int index = srcY * bytesPerRow + (srcX << 2);
+          final int cellIdx = rowOffset + gx;
+          if (index >= 0 && index + 2 < bytesLen) {
+            _gridR[cellIdx] = bytes[index + 2].toDouble();
+            _gridG[cellIdx] = bytes[index + 1].toDouble();
+            _gridB[cellIdx] = bytes[index].toDouble();
+          } else {
+            _gridR[cellIdx] = 0.0;
+            _gridG[cellIdx] = 0.0;
+            _gridB[cellIdx] = 0.0;
+          }
+        }
+      }
+    }
+  }
+
+  /// Samples a decoded static image into the 64x64 RGB grid for Stage 1 localization
+  void _extractGridFromDecodedImage(img.Image decoded) {
+    final int width = decoded.width;
+    final int height = decoded.height;
+
+    for (int gy = 0; gy < _gridSize; gy++) {
+      final int sy = ((gy + 0.5) * height / _gridSize).floor().clamp(0, height - 1);
+      final int rowOffset = gy * _gridSize;
+      for (int gx = 0; gx < _gridSize; gx++) {
+        final int sx = ((gx + 0.5) * width / _gridSize).floor().clamp(0, width - 1);
+        final p = decoded.getPixel(sx, sy);
+        final int cellIdx = rowOffset + gx;
+        _gridR[cellIdx] = p.r.toDouble();
+        _gridG[cellIdx] = p.g.toDouble();
+        _gridB[cellIdx] = p.b.toDouble();
+      }
+    }
+  }
+
+  /// Stage 1 Spatial Saliency + Connected-Component Object Localizer.
+  /// Detects the tight bounding box of the landmark/object in the 64x64 frame grid.
+  BoundingBox? _localizeObjectInGrid({bool useTrackingPrior = true}) {
+    // 1. Estimate background color from low-gradient perimeter cells & top sky region
+    double borderR = 0.0, borderG = 0.0, borderB = 0.0;
+    int borderCount = 0;
+
+    double topR = 0.0, topG = 0.0, topB = 0.0, topGradSum = 0.0;
+    int topCount = 0;
+
+    for (int gy = 0; gy < _gridSize; gy++) {
+      for (int gx = 0; gx < _gridSize; gx++) {
+        final bool isBorder = gx <= 1 || gx >= _gridSize - 2 || gy <= 1 || gy >= _gridSize - 2;
+        if (!isBorder) continue;
+
+        final int idx = gy * _gridSize + gx;
+        final int nx = (gx + 1 < _gridSize) ? gx + 1 : gx - 1;
+        final int ny = (gy + 1 < _gridSize) ? gy + 1 : gy - 1;
+        final int nIdxX = gy * _gridSize + nx;
+        final int nIdxY = ny * _gridSize + gx;
+
+        final double localGrad = ((_gridR[idx] - _gridR[nIdxX]).abs() +
+                (_gridG[idx] - _gridG[nIdxX]).abs() +
+                (_gridB[idx] - _gridB[nIdxX]).abs() +
+                (_gridR[idx] - _gridR[nIdxY]).abs() +
+                (_gridG[idx] - _gridG[nIdxY]).abs() +
+                (_gridB[idx] - _gridB[nIdxY]).abs()) /
+            6.0;
+
+        if (localGrad < 18.0) {
+          borderR += _gridR[idx];
+          borderG += _gridG[idx];
+          borderB += _gridB[idx];
+          borderCount++;
+        }
+
+        if (gy <= 2) {
+          topR += _gridR[idx];
+          topG += _gridG[idx];
+          topB += _gridB[idx];
+          topGradSum += localGrad;
+          topCount++;
+        }
+      }
+    }
+
+    if (borderCount > 0) {
+      borderR /= borderCount;
+      borderG /= borderCount;
+      borderB /= borderCount;
+    } else {
+      borderR = 128.0;
+      borderG = 128.0;
+      borderB = 128.0;
+    }
+
+    final double avgTopGrad = topCount > 0 ? topGradSum / topCount : 99.0;
+    if (topCount > 0) {
+      topR /= topCount;
+      topG /= topCount;
+      topB /= topCount;
+    }
+
+    // 2. Compute raw structural edge + foreground contrast activation per cell
+    _rawSal.fillRange(0, _gridCells, 0.0);
+
+    for (int gy = 1; gy < _gridSize - 1; gy++) {
+      final int rowOffset = gy * _gridSize;
+      for (int gx = 1; gx < _gridSize - 1; gx++) {
+        final int idx = rowOffset + gx;
+
+        final double dx = ((_gridR[idx + 1] - _gridR[idx - 1]).abs() +
+                (_gridG[idx + 1] - _gridG[idx - 1]).abs() +
+                (_gridB[idx + 1] - _gridB[idx - 1]).abs()) /
+            3.0;
+        final double dy = ((_gridR[idx + _gridSize] - _gridR[idx - _gridSize]).abs() +
+                (_gridG[idx + _gridSize] - _gridG[idx - _gridSize]).abs() +
+                (_gridB[idx + _gridSize] - _gridB[idx - _gridSize]).abs()) /
+            3.0;
+
+        double grad2 = 0.0;
+        if (gx >= 2 && gx < _gridSize - 2 && gy >= 2 && gy < _gridSize - 2) {
+          final double dx2 = ((_gridR[idx + 2] - _gridR[idx - 2]).abs() +
+                  (_gridG[idx + 2] - _gridG[idx - 2]).abs() +
+                  (_gridB[idx + 2] - _gridB[idx - 2]).abs()) /
+              3.0;
+          final double dy2 = ((_gridR[idx + 2 * _gridSize] - _gridR[idx - 2 * _gridSize]).abs() +
+                  (_gridG[idx + 2 * _gridSize] - _gridG[idx - 2 * _gridSize]).abs() +
+                  (_gridB[idx + 2 * _gridSize] - _gridB[idx - 2 * _gridSize]).abs()) /
+              3.0;
+          grad2 = (dx2 + dy2) * 0.5;
+        }
+
+        final double grad = (dx + dy) * 0.65 + grad2 * 0.35;
+        final double bgDiff = ((_gridR[idx] - borderR).abs() +
+                (_gridG[idx] - borderG).abs() +
+                (_gridB[idx] - borderB).abs()) /
+            3.0;
+
+        // Suppress uniform sky/ceiling above the monument so the top outline hugs the roofline/towers
+        if (gy < 26 && avgTopGrad < 16.0) {
+          final double skyDiff = ((_gridR[idx] - topR).abs() +
+                  (_gridG[idx] - topG).abs() +
+                  (_gridB[idx] - topB).abs()) /
+              3.0;
+          if (skyDiff < 20.0 && grad < 14.0) {
+            _rawSal[idx] = 0.0;
+            continue;
+          }
+        }
+
+        if (grad < 5.5 && bgDiff < 16.0) {
+          _rawSal[idx] = 0.0;
+        } else {
+          _rawSal[idx] = grad * 0.72 + bgDiff * 0.28;
+        }
+      }
+    }
+
+    // 3. 5x5 spatial density filter + gentle tracking continuity prior
+    _smoothSal.fillRange(0, _gridCells, 0.0);
+    double maxSal = 0.0;
+    double sumSal = 0.0;
+
+    final BoundingBox? priorBox = useTrackingPrior ? _trackedBox : null;
+    final double priorCx = priorBox?.centerX ?? 0.5;
+    final double priorCy = priorBox?.centerY ?? 0.5;
+
+    for (int gy = 2; gy < _gridSize - 2; gy++) {
+      final double v = (gy + 0.5) / _gridSize;
+      for (int gx = 2; gx < _gridSize - 2; gx++) {
+        final double u = (gx + 0.5) / _gridSize;
+        double acc = 0.0;
+        for (int ky = -2; ky <= 2; ky++) {
+          final int rOff = (gy + ky) * _gridSize + gx;
+          acc += _rawSal[rOff - 2] +
+              _rawSal[rOff - 1] +
+              _rawSal[rOff] +
+              _rawSal[rOff + 1] +
+              _rawSal[rOff + 2];
+        }
+        double val = acc / 25.0;
+
+        if (priorBox != null) {
+          final double distSq =
+              (u - priorCx) * (u - priorCx) + (v - priorCy) * (v - priorCy);
+          val *= (1.0 + 0.22 * exp(-distSq / 0.22));
+        }
+
+        final int idx = gy * _gridSize + gx;
+        _smoothSal[idx] = val;
+        sumSal += val;
+        if (val > maxSal) {
+          maxSal = val;
+        }
+      }
+    }
+
+    if (maxSal < 6.5) {
+      return null;
+    }
+
+    final double meanSal = sumSal / _gridCells;
+
+    // 4. Find the dominant object core centroid
+    final double coreThresh = maxSal * 0.60;
+    double coreSumX = 0.0;
+    double coreSumY = 0.0;
+    double coreWeight = 0.0;
+
+    for (int gy = 2; gy < _gridSize - 2; gy++) {
+      final int rowOffset = gy * _gridSize;
+      for (int gx = 2; gx < _gridSize - 2; gx++) {
+        final double w = _smoothSal[rowOffset + gx];
+        if (w >= coreThresh) {
+          coreSumX += gx * w;
+          coreSumY += gy * w;
+          coreWeight += w;
+        }
+      }
+    }
+
+    if (coreWeight <= 0.0) {
+      return null;
+    }
+
+    final int coreX = (coreSumX / coreWeight).round().clamp(2, _gridSize - 3);
+    final int coreY = (coreSumY / coreWeight).round().clamp(2, _gridSize - 3);
+
+    // 5. Connected-component region growing (with 2-cell bridge gap) around dominant object core
+    _visited.fillRange(0, _gridCells, 0);
+    _colWeight.fillRange(0, _gridSize, 0.0);
+    _rowWeight.fillRange(0, _gridSize, 0.0);
+
+    final double compThresh = max(meanSal * 1.12, maxSal * 0.27);
+    int qHead = 0;
+    int qTail = 0;
+
+    for (int dy = -3; dy <= 3; dy++) {
+      for (int dx = -3; dx <= 3; dx++) {
+        final int sx = (coreX + dx).clamp(2, _gridSize - 3);
+        final int sy = (coreY + dy).clamp(2, _gridSize - 3);
+        final int sIdx = sy * _gridSize + sx;
+        if (_visitedAt(sIdx) == 0 && _smoothSal[sIdx] >= compThresh) {
+          _visited[sIdx] = 1;
+          _bfsQueue[qTail++] = sIdx;
+        }
+      }
+    }
+
+    if (qTail == 0) {
+      final int cIdx = coreY * _gridSize + coreX;
+      _visited[cIdx] = 1;
+      _bfsQueue[qTail++] = cIdx;
+    }
+
+    double totalCompWeight = 0.0;
+    while (qHead < qTail) {
+      final int currIdx = _bfsQueue[qHead++];
+      final int cy = currIdx ~/ _gridSize;
+      final int cx = currIdx - cy * _gridSize;
+      final double w = _smoothSal[currIdx];
+
+      _colWeight[cx] += w;
+      _rowWeight[cy] += w;
+      totalCompWeight += w;
+
+      for (int ny = max(2, cy - 2); ny <= min(_gridSize - 3, cy + 2); ny++) {
+        final int nRow = ny * _gridSize;
+        for (int nx = max(2, cx - 2); nx <= min(_gridSize - 3, cx + 2); nx++) {
+          final int nIdx = nRow + nx;
+          if (_visited[nIdx] == 0 && _smoothSal[nIdx] >= compThresh) {
+            _visited[nIdx] = 1;
+            _bfsQueue[qTail++] = nIdx;
+          }
+        }
+      }
+    }
+
+    if (totalCompWeight <= 0.0) {
+      return null;
+    }
+
+    // 6. Compute tight 2.5% - 97.5% projection bounds of the connected object
+    final double lowCut = totalCompWeight * 0.025;
+    final double highCut = totalCompWeight * 0.975;
+
+    int minX = 2, maxX = _gridSize - 3;
+    double cumX = 0.0;
+    for (int gx = 0; gx < _gridSize; gx++) {
+      cumX += _colWeight[gx];
+      if (cumX >= lowCut) {
+        minX = gx;
+        break;
+      }
+    }
+    cumX = 0.0;
+    for (int gx = 0; gx < _gridSize; gx++) {
+      cumX += _colWeight[gx];
+      if (cumX >= highCut) {
+        maxX = gx;
+        break;
+      }
+    }
+
+    int minY = 2, maxY = _gridSize - 3;
+    double cumY = 0.0;
+    for (int gy = 0; gy < _gridSize; gy++) {
+      cumY += _rowWeight[gy];
+      if (cumY >= lowCut) {
+        minY = gy;
+        break;
+      }
+    }
+    cumY = 0.0;
+    for (int gy = 0; gy < _gridSize; gy++) {
+      cumY += _rowWeight[gy];
+      if (cumY >= highCut) {
+        maxY = gy;
+        break;
+      }
+    }
+
+    // Add 1.5 grid cells (~2.3%) exterior framing pad
+    final double rawLeft = ((minX - 1.5) / _gridSize).clamp(0.03, 0.86);
+    final double rawTop = ((minY - 1.5) / _gridSize).clamp(0.04, 0.86);
+    final double rawRight = ((maxX + 2.5) / _gridSize).clamp(rawLeft + 0.14, 0.97);
+    final double rawBottom = ((maxY + 2.5) / _gridSize).clamp(rawTop + 0.14, 0.96);
+
+    return BoundingBox(
+      left: rawLeft,
+      top: rawTop,
+      right: rawRight,
+      bottom: rawBottom,
+    );
+  }
+
+  int _visitedAt(int idx) => _visited[idx];
+
+  /// Velocity-adaptive EMA tracker so the outline smoothly & immediately follows the object
+  BoundingBox _updateTrackedBox(BoundingBox rawBox) {
+    if (_trackedBox == null) {
+      _trackedBox = rawBox;
+      return rawBox;
+    }
+
+    final prev = _trackedBox!;
+    final double dx = rawBox.centerX - prev.centerX;
+    final double dy = rawBox.centerY - prev.centerY;
+    final double shift = sqrt(dx * dx + dy * dy);
+    final double sizeDiff =
+        (rawBox.width - prev.width).abs() + (rawBox.height - prev.height).abs();
+
+    // Fast response when panning/moving object, rock-steady when holding still
+    final double alpha = (0.35 + shift * 2.8 + sizeDiff * 1.4).clamp(0.35, 0.90);
+
+    final smoothed = BoundingBox(
+      left: (prev.left + (rawBox.left - prev.left) * alpha).clamp(0.02, 0.88),
+      top: (prev.top + (rawBox.top - prev.top) * alpha).clamp(0.03, 0.88),
+      right: (prev.right + (rawBox.right - prev.right) * alpha).clamp(0.14, 0.98),
+      bottom: (prev.bottom + (rawBox.bottom - prev.bottom) * alpha).clamp(0.14, 0.97),
+    );
+    _trackedBox = smoothed;
+    return smoothed;
   }
 
   List<double> _calculateSoftmax(List<double> rawScores) {
@@ -293,93 +853,85 @@ class MLService extends ChangeNotifier {
     return expScores.map((e) => expSum > 0 ? e / expSum : 0.0).toList();
   }
 
-  /// Returns a clean, centered landmark-proportioned bounding box matching Photo Mode
-  BoundingBox _calculateLandmarkBoundingBox(
-    CameraImage image,
-    String landmarkKey,
-    int sensorOrientation,
-  ) {
-    switch (landmarkKey.toLowerCase()) {
-      case 'cathedral':
-        return const BoundingBox(
-          left: 0.14,
-          top: 0.15,
-          right: 0.86,
-          bottom: 0.73,
-        );
-      case 'lccb':
-        return const BoundingBox(
-          left: 0.08,
-          top: 0.18,
-          right: 0.92,
-          bottom: 0.68,
-        );
-      case 'plaza':
-      default:
-        return const BoundingBox(
-          left: 0.12,
-          top: 0.16,
-          right: 0.88,
-          bottom: 0.70,
-        );
-    }
-  }
+  void _updateCoordinateTables(
+    int width,
+    int height,
+    int sensorOrientation, {
+    double roiCenterU = 0.5,
+    double roiCenterV = 0.5,
+    double roiScale = 1.0,
+  }) {
+    final bool isRotated = sensorOrientation == 90 || sensorOrientation == 270;
+    final int uprightW = isRotated ? height : width;
+    final int uprightH = isRotated ? width : height;
 
-  void _updateCoordinateTables(int width, int height, int sensorOrientation) {
-    if (_cachedWidth == width &&
-        _cachedHeight == height &&
-        _cachedOrientation == sensorOrientation) {
-      return;
-    }
-    _cachedWidth = width;
-    _cachedHeight = height;
-    _cachedOrientation = sensorOrientation;
+    final int minDim = min(uprightW, uprightH);
+    final double cropSpan = (minDim * roiScale.clamp(0.40, 1.0)).clamp(64.0, minDim.toDouble());
+    final double halfSpan = cropSpan / 2.0;
 
-    final int cropSize = min(width, height);
-    final double centerX = width / 2.0;
-    final double centerY = height / 2.0;
+    final double centerUprightX =
+        (roiCenterU * uprightW).clamp(halfSpan, max(halfSpan, uprightW - halfSpan));
+    final double centerUprightY =
+        (roiCenterV * uprightH).clamp(halfSpan, max(halfSpan, uprightH - halfSpan));
 
     const int targetW = 224;
     const int targetH = 224;
 
     for (int outY = 0; outY < targetH; outY++) {
       final double v = (outY + 0.5) / targetH;
+      final int uprightY =
+          (centerUprightY + (v - 0.5) * cropSpan).round().clamp(0, uprightH - 1);
+
       if (sensorOrientation == 90) {
-        _srcXTable[outY] = (centerX + (v - 0.5) * cropSize).round().clamp(0, width - 1);
+        _srcXTable[outY] = uprightY.clamp(0, width - 1);
       } else if (sensorOrientation == 270) {
-        _srcXTable[outY] = (centerX + (0.5 - v) * cropSize).round().clamp(0, width - 1);
+        _srcXTable[outY] = ((width - 1) - uprightY).clamp(0, width - 1);
       } else if (sensorOrientation == 180) {
-        _srcXTable[outY] = (centerX + (0.5 - v) * cropSize).round().clamp(0, width - 1);
+        _srcYTable[outY] = ((height - 1) - uprightY).clamp(0, height - 1);
       } else {
-        _srcXTable[outY] = (centerX + (v - 0.5) * cropSize).round().clamp(0, width - 1);
+        _srcYTable[outY] = uprightY.clamp(0, height - 1);
       }
     }
 
     for (int outX = 0; outX < targetW; outX++) {
       final double u = (outX + 0.5) / targetW;
+      final int uprightX =
+          (centerUprightX + (u - 0.5) * cropSpan).round().clamp(0, uprightW - 1);
+
       if (sensorOrientation == 90) {
-        _srcYTable[outX] = (centerY + (0.5 - u) * cropSize).round().clamp(0, height - 1);
+        _srcYTable[outX] = ((height - 1) - uprightX).clamp(0, height - 1);
       } else if (sensorOrientation == 270) {
-        _srcYTable[outX] = (centerY + (u - 0.5) * cropSize).round().clamp(0, height - 1);
+        _srcYTable[outX] = uprightX.clamp(0, height - 1);
       } else if (sensorOrientation == 180) {
-        _srcYTable[outX] = (centerY + (0.5 - u) * cropSize).round().clamp(0, height - 1);
+        _srcXTable[outX] = ((width - 1) - uprightX).clamp(0, width - 1);
       } else {
-        _srcYTable[outX] = (centerY + (u - 0.5) * cropSize).round().clamp(0, height - 1);
+        _srcXTable[outX] = uprightX.clamp(0, width - 1);
       }
     }
   }
 
-  /// Extracts and rotates the central Target Frame to an upright [1, 224, 224, 3] Float tensor in [0.0, 255.0]
+  /// Extracts and rotates the localized ROI to an upright [1, 224, 224, 3] Float tensor in [0.0, 255.0]
   List<List<List<List<double>>>> _preprocessCameraImage(
     CameraImage image,
     int targetW,
     int targetH, {
     int sensorOrientation = 90,
+    double roiCenterU = 0.5,
+    double roiCenterV = 0.5,
+    double roiScale = 1.0,
   }) {
     final int width = image.width;
     final int height = image.height;
+    final bool isRotated = sensorOrientation == 90 || sensorOrientation == 270;
 
-    _updateCoordinateTables(width, height, sensorOrientation);
+    _updateCoordinateTables(
+      width,
+      height,
+      sensorOrientation,
+      roiCenterU: roiCenterU,
+      roiCenterV: roiCenterV,
+      roiScale: roiScale,
+    );
 
     // Android YUV420 format
     if (image.format.group == ImageFormatGroup.yuv420 || image.planes.length >= 3) {
@@ -402,19 +954,17 @@ class MLService extends ChangeNotifier {
       final int vPixelStride = vPlane.bytesPerPixel ?? 1;
 
       for (int outY = 0; outY < targetH; outY++) {
-        final int srcX = _srcXTable[outY];
-        final int uvX = srcX >> 1;
-        final int uColOffset = uvX * uvPixelStride;
-        final int vColOffset = uvX * vPixelStride;
         final row = _inputTensorBuffer[0][outY];
 
         for (int outX = 0; outX < targetW; outX++) {
-          final int srcY = _srcYTable[outX];
+          final int srcX = isRotated ? _srcXTable[outY] : _srcXTable[outX];
+          final int srcY = isRotated ? _srcYTable[outX] : _srcYTable[outY];
+          final int uvX = srcX >> 1;
           final int uvY = srcY >> 1;
 
           final int yIndex = srcY * yRowStride + srcX;
-          final int uIndex = uvY * uvRowStride + uColOffset;
-          final int vIndex = uvY * vRowStride + vColOffset;
+          final int uIndex = uvY * uvRowStride + uvX * uvPixelStride;
+          final int vIndex = uvY * vRowStride + uvX * vPixelStride;
 
           final int yVal = (yIndex < yLength) ? yBytes[yIndex] : 0;
           final int uVal = (uIndex >= 0 && uIndex < uLength) ? uBytes[uIndex] - 128 : 0;
@@ -441,11 +991,11 @@ class MLService extends ChangeNotifier {
       final int bytesLength = bytes.length;
 
       for (int outY = 0; outY < targetH; outY++) {
-        final int srcX = _srcXTable[outY];
         final row = _inputTensorBuffer[0][outY];
 
         for (int outX = 0; outX < targetW; outX++) {
-          final int srcY = _srcYTable[outX];
+          final int srcX = isRotated ? _srcXTable[outY] : _srcXTable[outX];
+          final int srcY = isRotated ? _srcYTable[outX] : _srcYTable[outY];
           final int index = srcY * bytesPerRow + (srcX << 2);
           final pixel = row[outX];
 
@@ -466,7 +1016,7 @@ class MLService extends ChangeNotifier {
     return _inputTensorBuffer;
   }
 
-  /// Process decoded image bytes (e.g. from snapshot or photo library)
+  /// Process decoded image bytes (e.g. from snapshot or photo library) with dynamic object localization
   Future<RecognitionResult?> processImageBytes(Uint8List bytes) async {
     final activeInterpreter = _interpreter ?? _cnnInterpreter;
     if (activeInterpreter == null) {
@@ -477,11 +1027,27 @@ class MLService extends ChangeNotifier {
       final decoded = img.decodeImage(bytes);
       if (decoded == null) return null;
 
-      final cropSize = min(decoded.width, decoded.height);
+      final Size imageSize = Size(decoded.width.toDouble(), decoded.height.toDouble());
+
+      // 1. Dynamically localize the object in the static photo
+      _extractGridFromDecodedImage(decoded);
+      final BoundingBox localizedBox = _localizeObjectInGrid(useTrackingPrior: false) ??
+          const BoundingBox(left: 0.12, top: 0.12, right: 0.88, bottom: 0.88);
+
+      // 2. Crop around the localized object (and compare with center crop)
+      final int minDim = min(decoded.width, decoded.height);
+      final double roiScale = (max(localizedBox.width, localizedBox.height) * 1.20).clamp(0.45, 1.0);
+      final int cropSize = (minDim * roiScale).round().clamp(64, minDim);
+      final int halfCrop = cropSize ~/ 2;
+      final int centerX =
+          (localizedBox.centerX * decoded.width).round().clamp(halfCrop, max(halfCrop, decoded.width - halfCrop));
+      final int centerY =
+          (localizedBox.centerY * decoded.height).round().clamp(halfCrop, max(halfCrop, decoded.height - halfCrop));
+
       final cropped = img.copyCrop(
         decoded,
-        x: (decoded.width - cropSize) ~/ 2,
-        y: (decoded.height - cropSize) ~/ 2,
+        x: (centerX - halfCrop).clamp(0, max(0, decoded.width - cropSize)),
+        y: (centerY - halfCrop).clamp(0, max(0, decoded.height - cropSize)),
         width: cropSize,
         height: cropSize,
       );
@@ -509,9 +1075,38 @@ class MLService extends ChangeNotifier {
       final output = List.generate(1, (_) => List.filled(numClasses, 0.0));
       activeInterpreter.run(input, output);
 
-      // 4. Calculate probabilities (model output is already softmax)
-      final rawScores = output[0];
-      final probabilities = _calculateSoftmax(rawScores);
+      List<double> probabilities = _calculateSoftmax(output[0]);
+
+      // Also check full center crop if ROI crop is smaller than full frame
+      if (cropSize < minDim * 0.92) {
+        final fullCropped = img.copyCrop(
+          decoded,
+          x: (decoded.width - minDim) ~/ 2,
+          y: (decoded.height - minDim) ~/ 2,
+          width: minDim,
+          height: minDim,
+        );
+        final fullResized = img.copyResize(fullCropped, width: 224, height: 224);
+        final fullInput = List.generate(
+          1,
+          (_) => List.generate(
+            224,
+            (y) => List.generate(
+              224,
+              (x) {
+                final p = fullResized.getPixel(x, y);
+                return [p.r.toDouble(), p.g.toDouble(), p.b.toDouble()];
+              },
+            ),
+          ),
+        );
+        final fullOutput = List.generate(1, (_) => List.filled(numClasses, 0.0));
+        activeInterpreter.run(fullInput, fullOutput);
+        final fullProbs = _calculateSoftmax(fullOutput[0]);
+        if (fullProbs.reduce(max) > probabilities.reduce(max)) {
+          probabilities = fullProbs;
+        }
+      }
 
       int bestIdx = 0;
       double bestProb = probabilities[0];
@@ -543,40 +1138,12 @@ class MLService extends ChangeNotifier {
         final landmark = LandmarkDataService.findByLabel(detectedKey);
 
         if (landmark != null) {
-          BoundingBox box;
-          switch (detectedKey.toLowerCase()) {
-            case 'cathedral':
-              box = const BoundingBox(
-                left: 0.16,
-                top: 0.10,
-                right: 0.84,
-                bottom: 0.88,
-              );
-              break;
-            case 'lccb':
-              box = const BoundingBox(
-                left: 0.08,
-                top: 0.16,
-                right: 0.92,
-                bottom: 0.82,
-              );
-              break;
-            case 'plaza':
-            default:
-              box = const BoundingBox(
-                left: 0.14,
-                top: 0.16,
-                right: 0.86,
-                bottom: 0.84,
-              );
-              break;
-          }
-
           return RecognitionResult(
             label: detectedKey,
             yoloConfidence: bestProb,
             cnnConfidence: bestProb,
-            boundingBox: box,
+            boundingBox: localizedBox,
+            imageSize: imageSize,
             inferenceTimeMs: 16,
             landmark: landmark,
             allProbabilities: probMap,
@@ -589,6 +1156,7 @@ class MLService extends ChangeNotifier {
         yoloConfidence: 0.0,
         cnnConfidence: 0.0,
         boundingBox: null,
+        imageSize: imageSize,
         inferenceTimeMs: 16,
         landmark: null,
         allProbabilities: probMap,
@@ -642,10 +1210,8 @@ class MLService extends ChangeNotifier {
 
   /// Stage 1: YOLO detection (Bounding Box & ROI localization)
   Future<_YoloDetection> _runStage1Yolo(String landmarkKey, double jitter) async {
-    // If native interpreter is available, run hardware tensor inference
     if (_yoloInterpreter != null) {
       try {
-        // Prepare dummy/real input tensor [1, 640, 640, 3]
         final input = List.generate(
           1,
           (_) => List.generate(
@@ -663,12 +1229,10 @@ class MLService extends ChangeNotifier {
       }
     }
 
-    // Dynamic bounding box with subtle realistic tracking jitter
     final rng = Random();
     final jX = (rng.nextDouble() - 0.5) * 0.015 + jitter;
     final jY = (rng.nextDouble() - 0.5) * 0.015;
 
-    // Centered bounding box tailored for historical landmarks
     final left = (0.16 + jX).clamp(0.05, 0.85);
     final top = (0.18 + jY).clamp(0.08, 0.85);
     final right = (0.84 + jX).clamp(left + 0.1, 0.95);

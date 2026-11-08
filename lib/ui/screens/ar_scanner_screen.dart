@@ -10,6 +10,7 @@ import '../../services/camera_service.dart';
 import '../widgets/ar_hud_overlay.dart';
 import 'landmark_detail_screen.dart';
 import 'photo_test_screen.dart';
+import 'qr_scanner_screen.dart';
 
 class ARScannerScreen extends StatefulWidget {
   const ARScannerScreen({super.key});
@@ -19,6 +20,8 @@ class ARScannerScreen extends StatefulWidget {
 }
 
 class _ARScannerScreenState extends State<ARScannerScreen> {
+  ScannerProvider? _scannerRef;
+
   @override
   void initState() {
     super.initState();
@@ -26,9 +29,17 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
       if (mounted) {
         final camera = Provider.of<CameraService>(context, listen: false);
         final scanner = Provider.of<ScannerProvider>(context, listen: false);
+        _scannerRef = scanner;
         scanner.bindCameraService(camera);
+        scanner.startScanning();
       }
     });
+  }
+
+  @override
+  void dispose() {
+    _scannerRef?.stopScanning();
+    super.dispose();
   }
 
   @override
@@ -214,10 +225,47 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          // Left: Heading Telemetry
+          // Left: Back to Mode Selector + Heading Telemetry
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
+              if (Navigator.of(context).canPop()) ...[
+                InkWell(
+                  onTap: () => Navigator.of(context).pop(),
+                  borderRadius: BorderRadius.circular(14),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF28221B),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: const Color(0xFFD4AF37).withValues(alpha: 0.35),
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.arrow_back_ios_new,
+                          color: Color(0xFFE5C158),
+                          size: 12,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          'MODES',
+                          style: GoogleFonts.outfit(
+                            color: const Color(0xFFF7EBE1),
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+              ],
               const Icon(Icons.explore_outlined, color: Color(0xFFD4AF37), size: 15),
               const SizedBox(width: 5),
               Text(
@@ -502,11 +550,30 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
             onTap: () => cameraService.switchCamera(),
           ),
 
-          // 3. Test with Photo Upload (Gallery / Sample tester)
+          // 3. Switch to QR Code Scanner
+          _buildDockButton(
+            icon: Icons.qr_code_scanner,
+            label: 'Scan QR',
+            color: const Color(0xFFFFE600),
+            onTap: () async {
+              scanner.stopScanning();
+              await Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const QRScannerScreen(),
+                ),
+              );
+              if (mounted) {
+                scanner.bindCameraService(cameraService);
+                scanner.startScanning();
+              }
+            },
+          ),
+
+          // 4. Test with Photo Upload (Gallery / Sample tester)
           _buildDockButton(
             icon: Icons.add_photo_alternate,
             label: 'Test Photo',
-            color: const Color(0xFFFFE600),
+            color: const Color(0xFFE5C158),
             onTap: () {
               Navigator.of(context).push(
                 MaterialPageRoute(

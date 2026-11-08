@@ -6,7 +6,7 @@ import 'package:provider/provider.dart';
 import 'providers/scanner_provider.dart';
 import 'services/camera_service.dart';
 import 'services/ml_service.dart';
-import 'ui/screens/ar_scanner_screen.dart';
+import 'ui/screens/home_selector_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -35,7 +35,6 @@ void main() async {
         ChangeNotifierProvider<ScannerProvider>(
           create: (_) => ScannerProvider(
             mlService: mlService,
-            cameraService: cameraService,
           ),
         ),
       ],
@@ -88,7 +87,7 @@ class ARLandmarkApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: const ARScannerScreen(),
+      home: const HomeSelectorScreen(),
     );
   }
 }

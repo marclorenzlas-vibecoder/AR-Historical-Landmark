@@ -44,6 +44,26 @@ void main() {
     expect(box.centerY, closeTo(0.4, 0.001));
   });
 
+  test('LandmarkDataService resolves QR contents LCCB, CATHEDRAL, and PLAZA', () {
+    final lccb = LandmarkDataService.findByQrContent('LCCB');
+    expect(lccb, isNotNull);
+    expect(lccb!.id, 'lccb');
+    expect(lccb.name, contains('La Consolacion'));
+
+    final cathedral = LandmarkDataService.findByQrContent('CATHEDRAL');
+    expect(cathedral, isNotNull);
+    expect(cathedral!.id, 'cathedral');
+    expect(cathedral.name, contains('San Sebastian Cathedral'));
+
+    final plaza = LandmarkDataService.findByQrContent('PLAZA');
+    expect(plaza, isNotNull);
+    expect(plaza!.id, 'plaza');
+    expect(plaza.name, contains('Public Plaza'));
+
+    final unknown = LandmarkDataService.findByQrContent('RANDOM_CODE');
+    expect(unknown, isNull);
+  });
+
   test('ScannerProvider initial state is searching with null landmark', () {
     final mlService = MLService();
     final provider = ScannerProvider(mlService: mlService);

@@ -753,7 +753,7 @@ class _PhotoTestScreenState extends State<PhotoTestScreen> {
               },
               icon: const Icon(Icons.auto_stories, color: Colors.black, size: 18),
               label: Text(
-                'EXPLORE FULL HISTORY & AUDIO GUIDE',
+                'EXPLORE FULL HISTORY',
                 style: GoogleFonts.outfit(
                   color: Colors.black,
                   fontWeight: FontWeight.bold,

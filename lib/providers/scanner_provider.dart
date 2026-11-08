@@ -60,6 +60,7 @@ class ScannerProvider extends ChangeNotifier {
     _currentResult = null;
     _candidateLabel = null;
     _consecutiveHitCount = 0;
+    mlService.resetTracking();
     notifyListeners();
   }
 
@@ -100,6 +101,7 @@ class ScannerProvider extends ChangeNotifier {
     _candidateLabel = null;
     _consecutiveHitCount = 0;
     _currentResult = null;
+    mlService.resetTracking();
     notifyListeners();
   }
 
@@ -111,14 +113,13 @@ class ScannerProvider extends ChangeNotifier {
     }
   }
 
-  /// Real-time camera image stream callback for live model inference
+  /// Real-time camera image stream callback for live model inference & object tracking
   void _onCameraFrame(CameraImage image) async {
     if (!_isScanning || _isProcessingFrame) return;
 
-    // Pace inferences to ~3 inferences per second (320ms interval).
-    // This gives near-instant landmark recognition while keeping camera feed locked at a silky-smooth 60fps.
+    // Process frames continuously back-to-back like its411yolo for real-time object tracking
     final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - _lastFrameTimestamp < 320) {
+    if (now - _lastFrameTimestamp < 16) {
       return;
     }
     _lastFrameTimestamp = now;
@@ -174,8 +175,11 @@ class ScannerProvider extends ChangeNotifier {
   }
 
   void _handleNewRecognition(RecognitionResult result) {
+    final bool isAlreadyLockedSameClass =
+        _currentResult?.landmark != null && _currentResult?.label == result.label;
     final bool isLandmarkHit = result.landmark != null &&
-        result.overallConfidence >= mlService.confidenceThreshold;
+        (isAlreadyLockedSameClass ||
+            result.overallConfidence >= mlService.confidenceThreshold);
 
     if (isLandmarkHit) {
       if (result.label == _candidateLabel) {
@@ -185,8 +189,8 @@ class ScannerProvider extends ChangeNotifier {
         _consecutiveHitCount = 1;
       }
 
-      // Require 2 consecutive confident hits to prevent single-frame false triggers
-      if (_consecutiveHitCount >= _requiredConsecutiveHits) {
+      // Require 2 consecutive hits for initial lock, then update every single frame while tracking
+      if (_consecutiveHitCount >= _requiredConsecutiveHits || isAlreadyLockedSameClass) {
         final bool isFirstLock = _currentResult?.landmark == null ||
             _currentResult?.label != result.label;
         _currentResult = result;

@@ -141,6 +141,29 @@ class LandmarkDataService {
     return null;
   }
 
+  /// Resolves a landmark from scanned QR code text (e.g. "LCCB", "CATHEDRAL", "PLAZA").
+  static Landmark? findByQrContent(String? qrContent) {
+    if (qrContent == null || qrContent.trim().isEmpty) return null;
+    final clean = qrContent.trim();
+
+    // 1. Direct match on labelKey / id / name (case-insensitive)
+    final direct = findByLabel(clean);
+    if (direct != null) return direct;
+
+    // 2. Substring / token match for QR payloads containing LCCB, CATHEDRAL, or PLAZA
+    final upper = clean.toUpperCase();
+    if (upper.contains('LCCB') || upper.contains('CONSOLACION')) {
+      return findByLabel('lccb');
+    }
+    if (upper.contains('CATHEDRAL') || upper.contains('SEBASTIAN')) {
+      return findByLabel('cathedral');
+    }
+    if (upper.contains('PLAZA')) {
+      return findByLabel('plaza');
+    }
+    return null;
+  }
+
   static Landmark? getById(String? id) {
     if (id == null || id.trim().isEmpty) return null;
     final clean = id.trim().toLowerCase();

@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_animate/flutter_animate.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../../models/landmark.dart';
 
@@ -13,8 +12,6 @@ class LandmarkDetailScreen extends StatefulWidget {
 }
 
 class _LandmarkDetailScreenState extends State<LandmarkDetailScreen> {
-  bool _isPlayingAudio = false;
-
   @override
   Widget build(BuildContext context) {
     final l = widget.landmark;
@@ -181,10 +178,6 @@ class _LandmarkDetailScreenState extends State<LandmarkDetailScreen> {
                   _buildQuickSpecsGrid(l, surfaceBrown, goldPrimary, textParchment),
                   const SizedBox(height: 24),
 
-                  // Audio Guide Interactive Player
-                  _buildAudioGuidePlayer(l, surfaceBrown, goldPrimary, goldLight, textParchment),
-                  const SizedBox(height: 26),
-
                   // Historical Overview Section
                   Text(
                     'HISTORICAL OVERVIEW',
@@ -321,139 +314,6 @@ class _LandmarkDetailScreenState extends State<LandmarkDetailScreen> {
           ),
         ),
       ],
-    );
-  }
-
-  Widget _buildAudioGuidePlayer(
-    Landmark l,
-    Color surfaceBrown,
-    Color goldPrimary,
-    Color goldLight,
-    Color textParchment,
-  ) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [
-            Color(0xFF231C16),
-            Color(0xFF1B1612),
-          ],
-        ),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: goldPrimary.withValues(alpha: 0.45)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.4),
-            blurRadius: 12,
-            offset: const Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(Icons.headphones, color: goldLight, size: 18),
-              const SizedBox(width: 8),
-              Text(
-                'MUSEUM AUDIO TOUR GUIDE',
-                style: GoogleFonts.outfit(
-                  color: goldLight,
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 1.0,
-                ),
-              ),
-              const Spacer(),
-              Text(
-                _isPlayingAudio ? 'PLAYING 01:24' : 'DURATION 02:45',
-                style: GoogleFonts.outfit(color: const Color(0xFFA5978B), fontSize: 10),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Text(
-            '"${l.audioGuideScript}"',
-            style: GoogleFonts.playfairDisplay(
-              color: textParchment,
-              fontSize: 14,
-              fontStyle: FontStyle.italic,
-              height: 1.5,
-            ),
-          ),
-          const SizedBox(height: 14),
-          Row(
-            children: [
-              GestureDetector(
-                onTap: () {
-                  setState(() {
-                    _isPlayingAudio = !_isPlayingAudio;
-                  });
-                },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: goldLight,
-                    borderRadius: BorderRadius.circular(20),
-                    boxShadow: [
-                      BoxShadow(
-                        color: goldLight.withValues(alpha: 0.35),
-                        blurRadius: 8,
-                      ),
-                    ],
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(
-                        _isPlayingAudio ? Icons.pause : Icons.play_arrow,
-                        color: Colors.black,
-                        size: 16,
-                      ),
-                      const SizedBox(width: 6),
-                      Text(
-                        _isPlayingAudio ? 'PAUSE GUIDE' : 'LISTEN TO GUIDE',
-                        style: GoogleFonts.outfit(
-                          color: Colors.black,
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(width: 14),
-              // Animated golden sound wave equalizer
-              if (_isPlayingAudio)
-                Expanded(
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: List.generate(
-                      14,
-                      (index) => Container(
-                        width: 3,
-                        height: 8 + (index % 5) * 4.0,
-                        decoration: BoxDecoration(
-                          color: goldLight,
-                          borderRadius: BorderRadius.circular(2),
-                        ),
-                      )
-                          .animate(onPlay: (c) => c.repeat(reverse: true))
-                          .scaleY(
-                            begin: 0.3,
-                            end: 1.8,
-                            delay: (index * 60).ms,
-                            duration: 350.ms,
-                          ),
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        ],
-      ),
     );
   }
 
