@@ -229,55 +229,43 @@ class MLService extends ChangeNotifier {
       // Smoothly track the localized object box across frames so the outline follows the object
       final BoundingBox smoothBox = _updateTrackedBox(detectedBox);
 
-      // 2. Stage 2 (ROI-Guided CNN): Sample 224x224 upright tensor centered on the tracked object
-      final double roiScale = (max(smoothBox.width, smoothBox.height) * 1.22).clamp(0.45, 1.0);
-      final input = _preprocessCameraImage(
+      // 2. Stage 2 (CNN Classification): Always classify the full upright center crop first
+      // (matches model training & processImageBytes so partial/off-center saliency boxes never
+      // feed a zoomed-in sub-patch that triggers the wrong landmark label).
+      final int numClasses = _labels.isNotEmpty ? _labels.length : 3;
+      List<double> probabilities = await _runInferenceOnCamera(
         image,
-        224,
-        224,
+        activeInterpreter,
+        numClasses,
         sensorOrientation: sensorOrientation,
-        roiCenterU: smoothBox.centerX,
-        roiCenterV: smoothBox.centerY,
-        roiScale: roiScale,
+        roiCenterU: 0.5,
+        roiCenterV: 0.5,
+        roiScale: 1.0,
       );
 
-      final numClasses = _labels.isNotEmpty ? _labels.length : 3;
-      final output = List.generate(1, (_) => List.filled(numClasses, 0.0));
+      final double acquireThreshold = _confidenceThreshold;
+      final double acquireMargin = (acquireThreshold * 0.45).clamp(0.18, 0.60);
 
-      if (_isolateInterpreter != null) {
-        await _isolateInterpreter!.run(input, output);
-      } else {
-        activeInterpreter.run(input, output);
-      }
+      // If center crop is not yet a strong hit and the localized ROI is distinct, check ROI crop too
+      final double centerBest = probabilities.reduce(max);
+      final double roiScale = (max(smoothBox.width, smoothBox.height) * 1.25).clamp(0.65, 1.0);
+      final bool hasDistinctRoi =
+          roiScale < 0.90 ||
+          (smoothBox.centerX - 0.5).abs() > 0.12 ||
+          (smoothBox.centerY - 0.5).abs() > 0.12;
 
-      List<double> probabilities = _calculateSoftmax(output[0]);
-
-      // If ROI is significantly off-center or zoomed, also check full center crop when acquiring lock
-      if (_lockedLandmarkKey == null &&
-          ((smoothBox.centerX - 0.5).abs() > 0.12 ||
-              (smoothBox.centerY - 0.5).abs() > 0.12 ||
-              roiScale < 0.85)) {
-        final double roiBest = probabilities.reduce(max);
-        if (roiBest < _confidenceThreshold) {
-          final centerInput = _preprocessCameraImage(
-            image,
-            224,
-            224,
-            sensorOrientation: sensorOrientation,
-            roiCenterU: 0.5,
-            roiCenterV: 0.5,
-            roiScale: 1.0,
-          );
-          final centerOutput = List.generate(1, (_) => List.filled(numClasses, 0.0));
-          if (_isolateInterpreter != null) {
-            await _isolateInterpreter!.run(centerInput, centerOutput);
-          } else {
-            activeInterpreter.run(centerInput, centerOutput);
-          }
-          final centerProbs = _calculateSoftmax(centerOutput[0]);
-          if (centerProbs.reduce(max) > roiBest) {
-            probabilities = centerProbs;
-          }
+      if (centerBest < acquireThreshold && hasDistinctRoi) {
+        final roiProbs = await _runInferenceOnCamera(
+          image,
+          activeInterpreter,
+          numClasses,
+          sensorOrientation: sensorOrientation,
+          roiCenterU: smoothBox.centerX,
+          roiCenterV: smoothBox.centerY,
+          roiScale: roiScale,
+        );
+        if (roiProbs.reduce(max) > centerBest) {
+          probabilities = roiProbs;
         }
       }
 
@@ -304,8 +292,6 @@ class MLService extends ChangeNotifier {
       }
 
       // 3. Decision & Continuous Object Tracking Hysteresis
-      final double acquireThreshold = _confidenceThreshold;
-      final double acquireMargin = (acquireThreshold * 0.45).clamp(0.18, 0.60);
       final bool isStrongHit = bestIdx >= 0 &&
           bestIdx < _labels.length &&
           bestProb >= acquireThreshold &&
@@ -332,16 +318,19 @@ class MLService extends ChangeNotifier {
         }
       }
 
-      // If already locked onto a landmark, keep following the object seamlessly during camera pans/tilts
+      // If already locked onto a landmark, keep following only while it remains the top class
+      // (never hold a stale label if another landmark class is winning).
       if (_lockedLandmarkKey != null) {
         final int lockedIdx = _labels.indexOf(_lockedLandmarkKey!);
         final double lockedClassProb =
             (lockedIdx >= 0 && lockedIdx < probabilities.length) ? probabilities[lockedIdx] : 0.0;
         final double trackContinuationThreshold = (acquireThreshold - 0.25).clamp(0.45, 0.75);
+        final bool anotherClassWinning =
+            bestIdx != lockedIdx && bestProb > (lockedClassProb + 0.08);
 
-        final bool continuesTracking =
-            (bestIdx == lockedIdx && lockedClassProb >= trackContinuationThreshold) ||
-                (_framesSinceStrongHit < 5 && lockedClassProb >= 0.38);
+        final bool continuesTracking = !anotherClassWinning &&
+            ((bestIdx == lockedIdx && lockedClassProb >= trackContinuationThreshold) ||
+                (_framesSinceStrongHit < 2 && lockedClassProb >= 0.45));
 
         if (continuesTracking) {
           _framesSinceStrongHit++;
@@ -378,6 +367,34 @@ class MLService extends ChangeNotifier {
       debugPrint('Real-time frame inference error: $e');
       return null;
     }
+  }
+
+  /// Preprocesses a camera frame for the given upright ROI and runs CNN inference.
+  Future<List<double>> _runInferenceOnCamera(
+    CameraImage image,
+    Interpreter activeInterpreter,
+    int numClasses, {
+    required int sensorOrientation,
+    required double roiCenterU,
+    required double roiCenterV,
+    required double roiScale,
+  }) async {
+    final input = _preprocessCameraImage(
+      image,
+      224,
+      224,
+      sensorOrientation: sensorOrientation,
+      roiCenterU: roiCenterU,
+      roiCenterV: roiCenterV,
+      roiScale: roiScale,
+    );
+    final output = List.generate(1, (_) => List.filled(numClasses, 0.0));
+    if (_isolateInterpreter != null) {
+      await _isolateInterpreter!.run(input, output);
+    } else {
+      activeInterpreter.run(input, output);
+    }
+    return _calculateSoftmax(output[0]);
   }
 
   /// Samples the full upright camera frame into the 64x64 RGB grid for Stage 1 localization

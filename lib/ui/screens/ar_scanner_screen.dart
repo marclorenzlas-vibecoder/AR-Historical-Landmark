@@ -21,6 +21,9 @@ class ARScannerScreen extends StatefulWidget {
 
 class _ARScannerScreenState extends State<ARScannerScreen> {
   ScannerProvider? _scannerRef;
+  bool _isDetailOpen = false;
+  String? _lastAutoOpenedLandmarkId;
+  static const double _autoOpenConfidenceThreshold = 0.80;
 
   @override
   void initState() {
@@ -30,14 +33,62 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
         final camera = Provider.of<CameraService>(context, listen: false);
         final scanner = Provider.of<ScannerProvider>(context, listen: false);
         _scannerRef = scanner;
+        scanner.addListener(_onScannerUpdate);
         scanner.bindCameraService(camera);
         scanner.startScanning();
       }
     });
   }
 
+  void _onScannerUpdate() {
+    if (!mounted || _isDetailOpen) return;
+    final scanner = _scannerRef;
+    if (scanner == null || !scanner.isScanning) return;
+
+    final result = scanner.currentResult;
+    final landmark = result?.landmark;
+    if (landmark == null) {
+      _lastAutoOpenedLandmarkId = null;
+      return;
+    }
+
+    if (result!.overallConfidence >= _autoOpenConfidenceThreshold &&
+        landmark.id != _lastAutoOpenedLandmarkId &&
+        (ModalRoute.of(context)?.isCurrent ?? true)) {
+      _openLandmarkDetail(landmark, autoTriggered: true);
+    }
+  }
+
+  Future<void> _openLandmarkDetail(
+    Landmark landmark, {
+    bool autoTriggered = false,
+  }) async {
+    if (_isDetailOpen || !mounted) return;
+    _isDetailOpen = true;
+    if (autoTriggered) {
+      _lastAutoOpenedLandmarkId = landmark.id;
+    }
+
+    final scanner = _scannerRef ?? Provider.of<ScannerProvider>(context, listen: false);
+    final cameraService = Provider.of<CameraService>(context, listen: false);
+    scanner.stopScanning();
+
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => LandmarkDetailScreen(landmark: landmark),
+      ),
+    );
+
+    if (mounted) {
+      _isDetailOpen = false;
+      scanner.bindCameraService(cameraService);
+      scanner.startScanning();
+    }
+  }
+
   @override
   void dispose() {
+    _scannerRef?.removeListener(_onScannerUpdate);
     _scannerRef?.stopScanning();
     super.dispose();
   }
