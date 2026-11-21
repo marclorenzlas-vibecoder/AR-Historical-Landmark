@@ -23,7 +23,7 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
   ScannerProvider? _scannerRef;
   bool _isDetailOpen = false;
   String? _lastAutoOpenedLandmarkId;
-  static const double _autoOpenConfidenceThreshold = 0.80;
+  static const double _autoOpenConfidenceThreshold = 0.95;
 
   @override
   void initState() {

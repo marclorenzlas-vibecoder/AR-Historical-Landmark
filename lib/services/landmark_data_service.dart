@@ -129,7 +129,16 @@ class LandmarkDataService {
   static Landmark? findByLabel(String? label) {
     if (label == null || label.trim().isEmpty) return null;
     final clean = label.trim().toLowerCase();
-    if (clean == 'searching' || clean == 'none' || clean == 'unknown') return null;
+    if (clean == 'searching' ||
+        clean == 'none' ||
+        clean == 'unknown' ||
+        clean == 'background' ||
+        clean == 'other' ||
+        clean == 'negative' ||
+        clean == 'not_landmark' ||
+        clean == 'non_landmark') {
+      return null;
+    }
 
     for (final l in allLandmarks) {
       if (l.labelKey.toLowerCase() == clean ||

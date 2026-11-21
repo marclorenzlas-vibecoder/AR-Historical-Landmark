@@ -16,7 +16,7 @@ class ScannerProvider extends ChangeNotifier {
   String? _candidateLabel;
   int _consecutiveHitCount = 0;
   int _lastFrameTimestamp = 0;
-  static const int _requiredConsecutiveHits = 2;
+  static const int _requiredConsecutiveHits = 5;
 
   final List<RecognitionResult> _discoveryHistory = [];
   double _simulatedDistance = 45.0;
@@ -147,7 +147,7 @@ class ScannerProvider extends ChangeNotifier {
     final bytes = await _cameraService!.captureFrameBytes();
     if (bytes != null) {
       final result = await mlService.processImageBytes(bytes);
-      if (result != null && result.landmark != null && result.overallConfidence >= 0.85) {
+      if (result != null && result.landmark != null && result.overallConfidence >= mlService.confidenceThreshold) {
         _currentResult = result;
         _candidateLabel = result.label;
         _consecutiveHitCount = 2;

@@ -59,7 +59,7 @@ class MLService extends ChangeNotifier {
     ),
   );
 
-  double _confidenceThreshold = 0.88; // Balanced default for fast lock & smooth tracking
+  double _confidenceThreshold = 0.95; // Strict default to prevent false triggers on non-landmarks
 
   bool get isInitialized => _isInitialized;
   MLInferenceMode get mode => _mode;
@@ -174,13 +174,15 @@ class MLService extends ChangeNotifier {
       final int uprightH = isRotated ? image.width : image.height;
       final Size uprightImageSize = Size(uprightW.toDouble(), uprightH.toDouble());
 
-      // 0. Quick scene texture check: avoid running model on flat walls, floors, ceilings, or covered lenses
+      // 0. Quick scene texture & lighting check: reject flat walls, floors, dark/covered lenses
       if (image.planes.isNotEmpty) {
         final Plane yPlane = image.planes[0];
         final Uint8List yBytes = yPlane.bytes;
         final int stride = yPlane.bytesPerRow;
         int minLuma = 255;
         int maxLuma = 0;
+        int lumaSum = 0;
+        int sampleCount = 0;
         for (int i = 1; i <= 5; i++) {
           final int sy = (image.height * i ~/ 6) * stride;
           for (int j = 1; j <= 5; j++) {
@@ -190,10 +192,13 @@ class MLService extends ChangeNotifier {
               final int val = yBytes[idx];
               if (val < minLuma) minLuma = val;
               if (val > maxLuma) maxLuma = val;
+              lumaSum += val;
+              sampleCount++;
             }
           }
         }
-        if ((maxLuma - minLuma) < 22) {
+        final double meanLuma = sampleCount > 0 ? lumaSum / sampleCount : 0.0;
+        if ((maxLuma - minLuma) < 32 || meanLuma < 20.0 || meanLuma > 245.0) {
           resetTracking();
           return RecognitionResult(
             label: 'searching',
@@ -229,9 +234,7 @@ class MLService extends ChangeNotifier {
       // Smoothly track the localized object box across frames so the outline follows the object
       final BoundingBox smoothBox = _updateTrackedBox(detectedBox);
 
-      // 2. Stage 2 (CNN Classification): Always classify the full upright center crop first
-      // (matches model training & processImageBytes so partial/off-center saliency boxes never
-      // feed a zoomed-in sub-patch that triggers the wrong landmark label).
+      // 2. Stage 2 (CNN Classification): Classify full upright center crop first
       final int numClasses = _labels.isNotEmpty ? _labels.length : 3;
       List<double> probabilities = await _runInferenceOnCamera(
         image,
@@ -244,33 +247,7 @@ class MLService extends ChangeNotifier {
       );
 
       final double acquireThreshold = _confidenceThreshold;
-      final double acquireMargin = (acquireThreshold * 0.45).clamp(0.18, 0.60);
-
-      // If center crop is not yet a strong hit and the localized ROI is distinct, check ROI crop too
-      final double centerBest = probabilities.reduce(max);
-      final double roiScale = (max(smoothBox.width, smoothBox.height) * 1.25).clamp(0.65, 1.0);
-      final bool hasDistinctRoi =
-          roiScale < 0.90 ||
-          (smoothBox.centerX - 0.5).abs() > 0.12 ||
-          (smoothBox.centerY - 0.5).abs() > 0.12;
-
-      if (centerBest < acquireThreshold && hasDistinctRoi) {
-        final roiProbs = await _runInferenceOnCamera(
-          image,
-          activeInterpreter,
-          numClasses,
-          sensorOrientation: sensorOrientation,
-          roiCenterU: smoothBox.centerX,
-          roiCenterV: smoothBox.centerY,
-          roiScale: roiScale,
-        );
-        if (roiProbs.reduce(max) > centerBest) {
-          probabilities = roiProbs;
-        }
-      }
-
-      stopwatch.stop();
-      _lastInferenceTimeMs = max(8, stopwatch.elapsedMilliseconds);
+      final double acquireMargin = (acquireThreshold * 0.68).clamp(0.45, 0.78);
 
       int bestIdx = 0;
       double bestProb = probabilities[0];
@@ -286,16 +263,62 @@ class MLService extends ChangeNotifier {
         }
       }
 
+      // Multi-view consistency verification:
+      // A closed-set 3-class softmax often spikes on random walls/desks in one view,
+      // so verify candidate hits against a second zoomed ROI crop and require BOTH views to agree.
+      bool verifiedBySecondView = false;
+      final bool looksLikeStrongCandidate = bestIdx >= 0 &&
+          bestIdx < _labels.length &&
+          bestProb >= acquireThreshold &&
+          (bestProb - secondProb) >= acquireMargin;
+
+      if (looksLikeStrongCandidate) {
+        final double verifyScale = (max(smoothBox.width, smoothBox.height) * 0.85).clamp(0.60, 0.78);
+        final verifyProbs = await _runInferenceOnCamera(
+          image,
+          activeInterpreter,
+          numClasses,
+          sensorOrientation: sensorOrientation,
+          roiCenterU: smoothBox.centerX,
+          roiCenterV: smoothBox.centerY,
+          roiScale: verifyScale,
+        );
+
+        int vBestIdx = 0;
+        double vBestProb = verifyProbs[0];
+        double vSecondProb = 0.0;
+        for (int i = 1; i < verifyProbs.length; i++) {
+          if (verifyProbs[i] > vBestProb) {
+            vSecondProb = vBestProb;
+            vBestProb = verifyProbs[i];
+            vBestIdx = i;
+          } else if (verifyProbs[i] > vSecondProb) {
+            vSecondProb = verifyProbs[i];
+          }
+        }
+
+        final double verifyThreshold = (acquireThreshold - 0.05).clamp(0.85, 0.96);
+        final double verifyMargin = (acquireMargin * 0.75).clamp(0.35, 0.65);
+
+        if (vBestIdx == bestIdx &&
+            vBestProb >= verifyThreshold &&
+            (vBestProb - vSecondProb) >= verifyMargin) {
+          verifiedBySecondView = true;
+          // Combine conservatively using geometric mean of both views
+          bestProb = sqrt(bestProb * vBestProb);
+        }
+      }
+
+      stopwatch.stop();
+      _lastInferenceTimeMs = max(8, stopwatch.elapsedMilliseconds);
+
       final Map<String, double> probMap = {};
       for (int i = 0; i < probabilities.length && i < _labels.length; i++) {
         probMap[_labels[i]] = probabilities[i];
       }
 
-      // 3. Decision & Continuous Object Tracking Hysteresis
-      final bool isStrongHit = bestIdx >= 0 &&
-          bestIdx < _labels.length &&
-          bestProb >= acquireThreshold &&
-          (bestProb - secondProb) >= acquireMargin;
+      // 3. Decision & Strict Continuous Object Tracking
+      final bool isStrongHit = looksLikeStrongCandidate && verifiedBySecondView;
 
       if (isStrongHit) {
         final detectedKey = _labels[bestIdx];
@@ -315,26 +338,26 @@ class MLService extends ChangeNotifier {
             landmark: landmark,
             allProbabilities: probMap,
           );
+        } else {
+          // Predicted a non-landmark class (e.g. 'unknown' / 'background')
+          resetTracking();
         }
       }
 
-      // If already locked onto a landmark, keep following only while it remains the top class
-      // (never hold a stale label if another landmark class is winning).
+      // Keep tracking only if the same landmark remains strongly dominant (no sticky false locks)
       if (_lockedLandmarkKey != null) {
         final int lockedIdx = _labels.indexOf(_lockedLandmarkKey!);
         final double lockedClassProb =
             (lockedIdx >= 0 && lockedIdx < probabilities.length) ? probabilities[lockedIdx] : 0.0;
-        final double trackContinuationThreshold = (acquireThreshold - 0.25).clamp(0.45, 0.75);
-        final bool anotherClassWinning =
-            bestIdx != lockedIdx && bestProb > (lockedClassProb + 0.08);
-
-        final bool continuesTracking = !anotherClassWinning &&
-            ((bestIdx == lockedIdx && lockedClassProb >= trackContinuationThreshold) ||
-                (_framesSinceStrongHit < 2 && lockedClassProb >= 0.45));
+        final double trackContinuationThreshold = (acquireThreshold - 0.08).clamp(0.82, 0.92);
+        final bool continuesTracking = bestIdx == lockedIdx &&
+            lockedClassProb >= trackContinuationThreshold &&
+            (lockedClassProb - secondProb) >= 0.45 &&
+            _framesSinceStrongHit < 1;
 
         if (continuesTracking) {
           _framesSinceStrongHit++;
-          _lockedConfidence = _lockedConfidence * 0.75 + max(lockedClassProb, bestProb) * 0.25;
+          _lockedConfidence = _lockedConfidence * 0.65 + lockedClassProb * 0.35;
           final landmark = LandmarkDataService.findByLabel(_lockedLandmarkKey!);
           if (landmark != null) {
             return RecognitionResult(
@@ -1092,73 +1115,82 @@ class MLService extends ChangeNotifier {
       final output = List.generate(1, (_) => List.filled(numClasses, 0.0));
       activeInterpreter.run(input, output);
 
-      List<double> probabilities = _calculateSoftmax(output[0]);
+      List<double> roiProbs = _calculateSoftmax(output[0]);
 
-      // Also check full center crop if ROI crop is smaller than full frame
-      if (cropSize < minDim * 0.92) {
-        final fullCropped = img.copyCrop(
-          decoded,
-          x: (decoded.width - minDim) ~/ 2,
-          y: (decoded.height - minDim) ~/ 2,
-          width: minDim,
-          height: minDim,
-        );
-        final fullResized = img.copyResize(fullCropped, width: 224, height: 224);
-        final fullInput = List.generate(
-          1,
-          (_) => List.generate(
+      // Always verify against full center crop and require both views to agree
+      final fullCropped = img.copyCrop(
+        decoded,
+        x: (decoded.width - minDim) ~/ 2,
+        y: (decoded.height - minDim) ~/ 2,
+        width: minDim,
+        height: minDim,
+      );
+      final fullResized = img.copyResize(fullCropped, width: 224, height: 224);
+      final fullInput = List.generate(
+        1,
+        (_) => List.generate(
+          224,
+          (y) => List.generate(
             224,
-            (y) => List.generate(
-              224,
-              (x) {
-                final p = fullResized.getPixel(x, y);
-                return [p.r.toDouble(), p.g.toDouble(), p.b.toDouble()];
-              },
-            ),
+            (x) {
+              final p = fullResized.getPixel(x, y);
+              return [p.r.toDouble(), p.g.toDouble(), p.b.toDouble()];
+            },
           ),
-        );
-        final fullOutput = List.generate(1, (_) => List.filled(numClasses, 0.0));
-        activeInterpreter.run(fullInput, fullOutput);
-        final fullProbs = _calculateSoftmax(fullOutput[0]);
-        if (fullProbs.reduce(max) > probabilities.reduce(max)) {
-          probabilities = fullProbs;
+        ),
+      );
+      final fullOutput = List.generate(1, (_) => List.filled(numClasses, 0.0));
+      activeInterpreter.run(fullInput, fullOutput);
+      final fullProbs = _calculateSoftmax(fullOutput[0]);
+
+      int fullBestIdx = 0;
+      double fullBestProb = fullProbs[0];
+      double fullSecondProb = 0.0;
+      for (int i = 1; i < fullProbs.length; i++) {
+        if (fullProbs[i] > fullBestProb) {
+          fullSecondProb = fullBestProb;
+          fullBestProb = fullProbs[i];
+          fullBestIdx = i;
+        } else if (fullProbs[i] > fullSecondProb) {
+          fullSecondProb = fullProbs[i];
         }
       }
 
-      int bestIdx = 0;
-      double bestProb = probabilities[0];
-      double secondProb = 0.0;
-      for (int i = 1; i < probabilities.length; i++) {
-        if (probabilities[i] > bestProb) {
-          secondProb = bestProb;
-          bestProb = probabilities[i];
-          bestIdx = i;
-        } else if (probabilities[i] > secondProb) {
-          secondProb = probabilities[i];
+      int roiBestIdx = 0;
+      double roiBestProb = roiProbs[0];
+      for (int i = 1; i < roiProbs.length; i++) {
+        if (roiProbs[i] > roiBestProb) {
+          roiBestProb = roiProbs[i];
+          roiBestIdx = i;
         }
       }
 
       final Map<String, double> probMap = {};
-      for (int i = 0; i < probabilities.length && i < _labels.length; i++) {
-        probMap[_labels[i]] = probabilities[i];
+      for (int i = 0; i < fullProbs.length && i < _labels.length; i++) {
+        probMap[_labels[i]] = fullProbs[i];
       }
 
-      final double effectiveThreshold = (_confidenceThreshold - 0.08).clamp(0.55, 0.95);
-      final double effectiveMargin = (effectiveThreshold * 0.35).clamp(0.15, 0.45);
-      final bool isConfident = bestIdx >= 0 &&
-          bestIdx < _labels.length &&
-          bestProb >= effectiveThreshold &&
-          (bestProb - secondProb) >= effectiveMargin;
+      final double effectiveThreshold = (_confidenceThreshold - 0.03).clamp(0.85, 0.96);
+      final double effectiveMargin = (effectiveThreshold * 0.60).clamp(0.45, 0.72);
+      final bool viewsAgree = fullBestIdx == roiBestIdx &&
+          roiBestProb >= (effectiveThreshold - 0.07).clamp(0.80, 0.94);
+
+      final bool isConfident = fullBestIdx >= 0 &&
+          fullBestIdx < _labels.length &&
+          fullBestProb >= effectiveThreshold &&
+          (fullBestProb - fullSecondProb) >= effectiveMargin &&
+          viewsAgree;
 
       if (isConfident) {
-        final detectedKey = _labels[bestIdx];
+        final detectedKey = _labels[fullBestIdx];
         final landmark = LandmarkDataService.findByLabel(detectedKey);
+        final combinedProb = sqrt(fullBestProb * roiBestProb);
 
         if (landmark != null) {
           return RecognitionResult(
             label: detectedKey,
-            yoloConfidence: bestProb,
-            cnnConfidence: bestProb,
+            yoloConfidence: combinedProb,
+            cnnConfidence: combinedProb,
             boundingBox: localizedBox,
             imageSize: imageSize,
             inferenceTimeMs: 16,
