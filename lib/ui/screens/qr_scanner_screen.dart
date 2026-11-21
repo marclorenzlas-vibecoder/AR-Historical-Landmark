@@ -329,7 +329,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
             const SizedBox(height: 12),
             Text(
               'QR Scanner Ready',
-              style: GoogleFonts.playfairDisplay(
+              style: GoogleFonts.outfit(
                 color: textParchment,
                 fontSize: 18,
                 fontWeight: FontWeight.bold,

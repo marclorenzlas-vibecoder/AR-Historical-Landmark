@@ -21,52 +21,21 @@ class HomeSelectorScreen extends StatelessWidget {
       backgroundColor: deepEspresso,
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 24),
+          padding: const EdgeInsets.fromLTRB(22, 8, 22, 24),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const SizedBox(height: 16),
-
-              // Top Emblem & App Title
+              // Top App Icon
               Center(
-                child: Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: surfaceBrown,
-                    border: Border.all(
-                      color: goldPrimary.withValues(alpha: 0.55),
-                      width: 1.8,
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: goldPrimary.withValues(alpha: 0.18),
-                        blurRadius: 28,
-                        spreadRadius: 2,
-                      ),
-                    ],
-                  ),
-                  child: const Icon(
-                    Icons.account_balance,
-                    size: 46,
-                    color: goldPrimary,
-                  ),
+                child: Image.asset(
+                  'assets/app_icon_nobg.png',
+                  width: 240,
+                  fit: BoxFit.contain,
                 ),
               ).animate().scale(duration: 350.ms, curve: Curves.easeOutBack),
 
-              const SizedBox(height: 18),
+              const SizedBox(height: 12),
 
-              Text(
-                'ARcVision',
-                textAlign: TextAlign.center,
-                style: GoogleFonts.playfairDisplay(
-                  color: textParchment,
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 1.2,
-                ),
-              ),
-              const SizedBox(height: 6),
               Text(
                 'HISTORICAL LANDMARK HERITAGE EXPLORER',
                 textAlign: TextAlign.center,
@@ -210,7 +179,7 @@ class HomeSelectorScreen extends StatelessWidget {
                       const SizedBox(height: 3),
                       Text(
                         title,
-                        style: GoogleFonts.playfairDisplay(
+                        style: GoogleFonts.outfit(
                           color: textParchment,
                           fontSize: 20,
                           fontWeight: FontWeight.bold,

@@ -136,7 +136,7 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
           // 4. Bottom Landmark Identification Label Card (Prominently displays detected monument)
           if (scanner.currentResult?.landmark != null)
             Positioned(
-              bottom: 104,
+              bottom: 144,
               left: 16,
               right: 16,
               child: _buildBottomLandmarkCard(
@@ -147,7 +147,17 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
               ),
             ),
 
-          // 5. Bottom Explorer Control Dock (Zero archive/testing simulations - 100% automatic live detection)
+          // 5. Live Accuracy Percentage Indicator (Bottom middle, right above control dock)
+          Positioned(
+            bottom: 98,
+            left: 16,
+            right: 16,
+            child: Center(
+              child: _buildAccuracyIndicator(scanner),
+            ),
+          ),
+
+          // 6. Bottom Explorer Control Dock (Zero archive/testing simulations - 100% automatic live detection)
           Positioned(
             bottom: 24,
             left: 16,
@@ -230,7 +240,7 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
             const SizedBox(height: 20),
             Text(
               'ARcVision',
-              style: GoogleFonts.playfairDisplay(
+              style: GoogleFonts.outfit(
                 color: const Color(0xFFF7EBE1),
                 fontSize: 20,
                 fontWeight: FontWeight.bold,
@@ -561,6 +571,82 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
         ],
       ),
     ).animate().slideY(begin: 0.25, end: 0, duration: 200.ms).fadeIn();
+  }
+
+  Widget _buildAccuracyIndicator(ScannerProvider scanner) {
+    final double accuracy = scanner.liveAccuracy.clamp(0.0, 1.0);
+    final int accuracyPct = (accuracy * 100).round();
+
+    final Color accentColor;
+    if (accuracy >= _autoOpenConfidenceThreshold) {
+      accentColor = const Color(0xFF68D391); // High accuracy (80%+)
+    } else if (accuracy >= 0.50) {
+      accentColor = const Color(0xFFFFE600); // Moderate confidence
+    } else {
+      accentColor = const Color(0xFFC7B9AC); // Searching / low confidence
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+      decoration: BoxDecoration(
+        color: const Color(0xEE1C1814),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: accentColor.withValues(alpha: 0.55),
+          width: 1.1,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.55),
+            blurRadius: 10,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            Icons.track_changes,
+            color: accentColor,
+            size: 14,
+          ),
+          const SizedBox(width: 6),
+          Text(
+            'ACCURACY',
+            style: GoogleFonts.outfit(
+              color: const Color(0xFFC7B9AC),
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 0.8,
+            ),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 64,
+            height: 6,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: LinearProgressIndicator(
+                value: accuracy,
+                backgroundColor: const Color(0xFF332B24),
+                valueColor: AlwaysStoppedAnimation<Color>(accentColor),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            '$accuracyPct%',
+            style: GoogleFonts.outfit(
+              color: accentColor,
+              fontSize: 12,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 0.4,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildHeritageControlDock(
@@ -1062,7 +1148,7 @@ class _ARScannerScreenState extends State<ARScannerScreen> {
             const SizedBox(width: 10),
             Text(
               'Trained Landmark Model',
-              style: GoogleFonts.playfairDisplay(
+              style: GoogleFonts.outfit(
                 color: const Color(0xFFF7EBE1),
                 fontSize: 18,
                 fontWeight: FontWeight.bold,

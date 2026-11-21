@@ -131,7 +131,7 @@ class _LandmarkDetailScreenState extends State<LandmarkDetailScreen> {
                         const SizedBox(height: 8),
                         Text(
                           l.name,
-                          style: GoogleFonts.playfairDisplay(
+                          style: GoogleFonts.outfit(
                             color: textParchment,
                             fontSize: 30,
                             fontWeight: FontWeight.bold,
@@ -346,7 +346,7 @@ class _LandmarkDetailScreenState extends State<LandmarkDetailScreen> {
               children: [
                 Text(
                   event.title,
-                  style: GoogleFonts.playfairDisplay(
+                  style: GoogleFonts.outfit(
                     color: textParchment,
                     fontSize: 14,
                     fontWeight: FontWeight.bold,

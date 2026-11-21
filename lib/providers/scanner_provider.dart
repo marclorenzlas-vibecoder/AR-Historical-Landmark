@@ -11,6 +11,7 @@ class ScannerProvider extends ChangeNotifier {
   bool _isScanning = true;
   bool _isProcessingFrame = false;
   RecognitionResult? _currentResult;
+  double _liveAccuracy = 0.0;
 
   // Temporal multi-frame stability counters (avoids noise blips from random objects)
   String? _candidateLabel;
@@ -48,6 +49,7 @@ class ScannerProvider extends ChangeNotifier {
   bool get isScanning => _isScanning;
   bool get isProcessingFrame => _isProcessingFrame;
   RecognitionResult? get currentResult => _currentResult;
+  double get liveAccuracy => _liveAccuracy;
   List<RecognitionResult> get discoveryHistory => List.unmodifiable(_discoveryHistory);
   double get simulatedDistance => _simulatedDistance;
   double get headingDegrees => _headingDegrees;
@@ -58,6 +60,7 @@ class ScannerProvider extends ChangeNotifier {
   /// Manually clears current recognition and turns off bounding box and bottom card
   void clearCurrentResult() {
     _currentResult = null;
+    _liveAccuracy = 0.0;
     _candidateLabel = null;
     _consecutiveHitCount = 0;
     mlService.resetTracking();
@@ -101,6 +104,7 @@ class ScannerProvider extends ChangeNotifier {
     _candidateLabel = null;
     _consecutiveHitCount = 0;
     _currentResult = null;
+    _liveAccuracy = 0.0;
     mlService.resetTracking();
     notifyListeners();
   }
@@ -175,6 +179,8 @@ class ScannerProvider extends ChangeNotifier {
   }
 
   void _handleNewRecognition(RecognitionResult result) {
+    final double prevAccuracy = _liveAccuracy;
+
     final bool isAlreadyLockedSameClass =
         _currentResult?.landmark != null && _currentResult?.label == result.label;
     final bool isLandmarkHit = result.landmark != null &&
@@ -194,6 +200,7 @@ class ScannerProvider extends ChangeNotifier {
         final bool isFirstLock = _currentResult?.landmark == null ||
             _currentResult?.label != result.label;
         _currentResult = result;
+        _liveAccuracy = result.overallConfidence.clamp(0.0, 1.0);
         _simulatedDistance = result.landmark!.estimatedDistanceMeters;
 
         if (isFirstLock) {
@@ -206,17 +213,46 @@ class ScannerProvider extends ChangeNotifier {
           }
         }
         notifyListeners();
+      } else {
+        // First hit (awaiting 2nd consecutive confirmation): show high progress but below 80%
+        final double target =
+            (_scaledSearchingAccuracy(result.overallConfidence)).clamp(0.0, 0.79);
+        _liveAccuracy = (_liveAccuracy * 0.4 + target * 0.6).clamp(0.0, 0.79);
+        if ((_liveAccuracy - prevAccuracy).abs() >= 0.005) {
+          notifyListeners();
+        }
       }
     } else {
       _candidateLabel = null;
       _consecutiveHitCount = 0;
 
+      // Searching / unconfirmed frame: scale relative to lock threshold and keep strictly below 80%
+      if (result.allProbabilities.isEmpty) {
+        _liveAccuracy = 0.0;
+      } else {
+        final double rawTop = result.allProbabilities.values
+            .reduce((a, b) => a > b ? a : b);
+        final double target = _scaledSearchingAccuracy(rawTop);
+        _liveAccuracy = (_liveAccuracy * 0.6 + target * 0.4).clamp(0.0, 0.79);
+      }
+
       // When pointing at desk, floor, or away from monument: IMMEDIATELY TURN OFF!
       if (_currentResult != null) {
         _currentResult = null;
         notifyListeners();
+      } else if ((_liveAccuracy - prevAccuracy).abs() >= 0.005) {
+        notifyListeners();
       }
     }
+  }
+
+  /// Maps raw unconfirmed softmax probability [0.34..confidenceThreshold] into [0.0..0.79]
+  /// so the indicator only reaches 80%+ when a landmark is genuinely confirmed and locked.
+  double _scaledSearchingAccuracy(double rawTop) {
+    final double threshold = mlService.confidenceThreshold;
+    final double span = (threshold - 0.34).clamp(0.10, 1.0);
+    final double normalized = ((rawTop - 0.34) / span).clamp(0.0, 1.0);
+    return normalized * 0.79;
   }
 
   void setSimulatedTelemetry({

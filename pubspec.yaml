@@ -67,6 +67,8 @@ flutter:
   uses-material-design: true
 
   assets:
+    - assets/app_icon.png
+    - assets/app_icon_nobg.png
     - assets/landmarks/
     - model/
     - model/labels/

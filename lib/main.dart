@@ -6,7 +6,7 @@ import 'package:provider/provider.dart';
 import 'providers/scanner_provider.dart';
 import 'services/camera_service.dart';
 import 'services/ml_service.dart';
-import 'ui/screens/home_selector_screen.dart';
+import 'ui/screens/splash_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -72,22 +72,22 @@ class ARLandmarkApp extends StatelessWidget {
           onSurface: warmParchment,
         ),
         textTheme: GoogleFonts.outfitTextTheme(baseTextTheme).copyWith(
-          headlineLarge: GoogleFonts.playfairDisplay(
+          headlineLarge: GoogleFonts.outfit(
             fontWeight: FontWeight.bold,
             color: warmParchment,
           ),
-          headlineMedium: GoogleFonts.playfairDisplay(
+          headlineMedium: GoogleFonts.outfit(
             fontWeight: FontWeight.bold,
             color: warmParchment,
           ),
-          titleLarge: GoogleFonts.playfairDisplay(
+          titleLarge: GoogleFonts.outfit(
             fontWeight: FontWeight.w700,
             color: primaryGold,
           ),
         ),
         useMaterial3: true,
       ),
-      home: const HomeSelectorScreen(),
+      home: const SplashScreen(),
     );
   }
 }
